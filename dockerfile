@@ -7,4 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bts_scraper_bot.py .
 
+EXPOSE 8000
+
 CMD ["python", "bts_scraper_bot.py"]
