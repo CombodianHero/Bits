@@ -1,13 +1,14 @@
 """
-Bridge to Success — Developer Course Scraper Bot
-Login via mobile + password, fetch all courses and their content links.
-Reads BOT_TOKEN from environment variable (Koyeb-friendly).
+Bridge to Success — Dev Scraper Bot
+Fixed: Koyeb TCP health check on port 8000 + PTBUserWarning
 """
 
 import logging
 import os
+import threading
 import requests
 import json
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -18,6 +19,7 @@ from telegram.ext import (
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+PORT      = int(os.environ.get("PORT", 8000))   # Koyeb health check port
 
 BASE_URL = "https://bridgetosuccess.learncentre.tech"
 API_BASE = f"{BASE_URL}/public/study_api_sprint13_security_promo/"
@@ -27,6 +29,25 @@ STORAGE = {
     "pdf"   : f"{BASE_URL}/public/storage/pdf/",
     "ebook" : f"{BASE_URL}/public/storage/ebook/",
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEALTH CHECK SERVER (fixes Koyeb TCP health check)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass   # silence access logs
+
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    server.serve_forever()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONVERSATION STATES
@@ -155,7 +176,7 @@ def scrape_course(course_id, course_name: str, uid: int) -> list:
             }
 
             # Videos
-            vid_r  = api_post("get-video-list", payload, uid)
+            vid_r = api_post("get-video-list", payload, uid)
             for v in as_list(vid_r.get("data", [])):
                 results.append({
                     "type"    : "VIDEO",
@@ -210,19 +231,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid    = update.effective_user.id
     status = "✅ Logged in" if uid in sessions else "❌ Not logged in"
     kb = [
-        [InlineKeyboardButton("🔑 Login",                callback_data="do_login")],
-        [InlineKeyboardButton("📦 All Courses + Links",  callback_data="do_all")],
-        [InlineKeyboardButton("🎬 Videos Only",          callback_data="do_videos")],
-        [InlineKeyboardButton("📄 PDFs Only",            callback_data="do_pdfs")],
-        [InlineKeyboardButton("💾 Export JSON",          callback_data="do_json")],
-        [InlineKeyboardButton("🚪 Logout",               callback_data="do_logout")],
+        [InlineKeyboardButton("🔑 Login",               callback_data="do_login")],
+        [InlineKeyboardButton("📦 All Courses + Links", callback_data="do_all")],
+        [InlineKeyboardButton("🎬 Videos Only",         callback_data="do_videos")],
+        [InlineKeyboardButton("📄 PDFs Only",           callback_data="do_pdfs")],
+        [InlineKeyboardButton("💾 Export JSON",         callback_data="do_json")],
+        [InlineKeyboardButton("🚪 Logout",              callback_data="do_logout")],
     ]
     await update.message.reply_text(
         f"🎓 *Bridge to Success — Dev Scraper*\n\nStatus: {status}\n\nChoose an action:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
-
 
 # ── LOGIN CONVERSATION ───────────────────────────────────────────────────────
 
@@ -279,8 +299,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
-
-# ── SCRAPE ───────────────────────────────────────────────────────────────────
+# ── SCRAPE HANDLERS ──────────────────────────────────────────────────────────
 
 async def do_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     filter_type: str = None, export_json: bool = False):
@@ -346,7 +365,7 @@ async def do_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE,
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    uid = update.effective_user.id
+    uid    = update.effective_user.id
     action = q.data
 
     if   action == "do_login"  : await login_entry(update, context)
@@ -364,10 +383,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        raise ValueError("Set BOT_TOKEN env variable before running!")
+        raise ValueError("Set BOT_TOKEN environment variable!")
+
+    # Start health check server in background thread (fixes Koyeb TCP check)
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+    logging.info(f"Health check server running on port {PORT}")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Fixed: per_message=True removes the PTBUserWarning
     login_conv = ConversationHandler(
         entry_points=[
             CommandHandler("login", login_entry),
@@ -378,6 +403,8 @@ def main():
             PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_password)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,   # correct for text-based conversation flow
+        per_chat=True,
     )
 
     app.add_handler(login_conv)
