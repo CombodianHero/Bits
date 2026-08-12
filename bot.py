@@ -35,6 +35,7 @@ user_credentials = {}    # user_id -> (mobile, password, android_id)
 user_courses = {}        # user_id -> list of course dicts (myCourses)
 user_all_courses = {}    # user_id -> list of all courses (allCourses)
 user_free_categories = {} # user_id -> list of free category dicts
+user_raw_responses = {}  # user_id -> raw JSON for debugging
 
 # -------------------------------------------------------------------
 # Helper: stable device ID per user (to avoid multiple-device warnings)
@@ -65,7 +66,6 @@ class BridgeToSuccessAPI:
             "Connection": "close",
         })
         self.last_login_time = 0
-        logger.info(f"API client initialized for user: {mobile}")
 
     def _default_headers(self):
         headers = {
@@ -94,7 +94,6 @@ class BridgeToSuccessAPI:
                 if e.response.status_code == 401:
                     logger.warning(f"401 Unauthorized. Attempt {attempt+1}/{retries}")
                     if self.mobile and self.password and attempt < retries - 1:
-                        # Cooldown to avoid rate‑limiting
                         if time.time() - self.last_login_time < 300:
                             time.sleep(30)
                         self._re_login()
@@ -110,7 +109,6 @@ class BridgeToSuccessAPI:
                     raise
                 wait = 2 ** attempt
                 time.sleep(wait)
-                # Recreate session to reset connection
                 self.session = requests.Session()
                 self.session.headers.update(self._default_headers())
 
@@ -153,17 +151,19 @@ class BridgeToSuccessAPI:
     def call(self, tag, **params):
         return self.post({"tag": tag, **params})
 
-    # --- All API methods (same as before) ---
+    # --- Authentication ---
     def login_api(self, mobile, password, android_id="", fcm_id=""):
         return self.call("login", mobile=mobile, password=password,
                          androidId=android_id, fcmId=fcm_id)
 
+    # --- Profile ---
     def get_profile(self):
         return self.call("getProfile", userId=self.user_id)
 
     def get_notifications(self):
         return self.call("getNotifications", userId=self.user_id)
 
+    # --- Courses ---
     def all_courses(self, is_ebook=False):
         return self.call("allCourses", userId=self.user_id, isEBook=1 if is_ebook else 0)
 
@@ -185,6 +185,7 @@ class BridgeToSuccessAPI:
     def my_course_pdf(self, category_id):
         return self.call("myCoursePdf", categoryId=category_id, userId=self.user_id)
 
+    # --- Free content ---
     def free_course_video(self):
         return self.call("freeCourseVideo", userId=self.user_id)
 
@@ -198,12 +199,25 @@ class BridgeToSuccessAPI:
         return self.call("getFreeContent", userId=self.user_id, courseType=course_type,
                          categoryId=category_id, pageNumber=str(page), pageItemSize=str(page_size))
 
+    # --- Bulk fetch for a user (used after login) ---
     def fetch_all_courses_with_details(self, fetch_my=False):
+        """Fetch all courses (or my courses) with full details including price.
+           Merges both isEBook=false and isEBook=true for all courses."""
         if fetch_my:
             courses_data = self.my_courses()
+            courses = extract_courses(courses_data)
         else:
-            courses_data = self.all_courses()
-        courses = extract_courses(courses_data)
+            # Fetch both types and combine
+            normal_data = self.all_courses(is_ebook=False)
+            ebook_data = self.all_courses(is_ebook=True)
+            courses_normal = extract_courses(normal_data)
+            courses_ebook = extract_courses(ebook_data)
+            # Deduplicate by courseId
+            combined = {}
+            for c in courses_normal + courses_ebook:
+                combined[c['courseId']] = c
+            courses = list(combined.values())
+
         result = []
         for course in courses:
             course_id = course["courseId"]
@@ -258,7 +272,7 @@ class BridgeToSuccessAPI:
         return free_videos, free_pdfs
 
 # -------------------------------------------------------------------
-# Helper functions (same as before)
+# Helper functions
 # -------------------------------------------------------------------
 def extract_courses(json_data):
     courses = []
@@ -378,9 +392,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/free_select <number> – export media from a free category\n"
         "/profile – your profile info\n"
         "/notifications – your notifications\n"
+        "/debug – dump raw API response (for troubleshooting)\n"
         "/session – check your current session status\n"
         "/help – this message"
     )
+
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if not api:
+        await update.message.reply_text("❌ Not logged in.")
+        return
+    # Fetch all courses raw and show a summary
+    try:
+        normal = api.all_courses(is_ebook=False)
+        ebook = api.all_courses(is_ebook=True)
+        # Save to file
+        data = {
+            "normal": normal,
+            "ebook": ebook
+        }
+        filename = f"debug_{user_id}.json"
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        await update.message.reply_document(
+            document=open(filename, "rb"),
+            filename="debug_courses.json",
+            caption="Raw API responses for allCourses (isEBook=0 and isEBook=1)."
+        )
+        os.remove(filename)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -476,8 +518,6 @@ async def courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             user_courses[user_id] = courses_list
         except PermissionError as e:
-            # Token expired – re‑login already attempted in post()
-            # If it still fails, tell user to re‑login manually.
             await update.message.reply_text(f"❌ Session expired. Please /login again.")
             return
         except Exception as e:
@@ -495,6 +535,7 @@ async def courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def allcourses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all available courses with price and full details (videos, PDFs)."""
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
     if not api:
@@ -800,6 +841,7 @@ def main():
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("login", login))
     app.add_handler(CommandHandler("logout", logout))
+    app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("session", session_command))
     app.add_handler(CommandHandler("courses", courses))
     app.add_handler(CommandHandler("allcourses", allcourses))
