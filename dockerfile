@@ -5,8 +5,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bts_scraper_bot.py .
+COPY bot.py .
 
-EXPOSE 8000
-
-CMD ["python", "bts_scraper_bot.py"]
+CMD ["python", "bot.py"]
