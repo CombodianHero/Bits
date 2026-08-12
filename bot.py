@@ -23,7 +23,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎓 *Bridge to Success Bot*\n\n"
         "I can help you access your courses, videos, and PDFs.\n"
-        "Use /login <mobile> <password> to authenticate.\n"
+        "Use /login `mobile` `password` to authenticate.\n"
         "Then try /courses, /videos, /pdfs, /scrape, /download_pdf.\n"
         "Use /logout to clear your session.",
         parse_mode="Markdown"
@@ -33,7 +33,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("Usage: /login <mobile> <password>")
+        await update.message.reply_text("Usage: /login `mobile` `password`", parse_mode="Markdown")
         return
     mobile, password = args[0], args[1]
     store = {}
@@ -79,7 +79,7 @@ async def courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 3:
-        await update.message.reply_text("Usage: /videos <course_id> <subject_id> <chapter_id>")
+        await update.message.reply_text("Usage: /videos `course_id` `subject_id` `chapter_id`", parse_mode="Markdown")
         return
     course_id, subject_id, chapter_id = args[0], args[1], args[2]
     app = user_sessions.get(update.effective_user.id)
@@ -103,7 +103,7 @@ async def videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pdfs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 3:
-        await update.message.reply_text("Usage: /pdfs <course_id> <subject_id> <chapter_id>")
+        await update.message.reply_text("Usage: /pdfs `course_id` `subject_id` `chapter_id`", parse_mode="Markdown")
         return
     course_id, subject_id, chapter_id = args[0], args[1], args[2]
     app = user_sessions.get(update.effective_user.id)
@@ -127,7 +127,7 @@ async def pdfs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def download_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 1:
-        await update.message.reply_text("Usage: /download_pdf <pdf_url_or_filename>")
+        await update.message.reply_text("Usage: /download_pdf `pdf_url_or_filename`", parse_mode="Markdown")
         return
     url_or_name = args[0]
     app = user_sessions.get(update.effective_user.id)
@@ -146,7 +146,7 @@ async def download_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 1:
-        await update.message.reply_text("Usage: /scrape <course_id>")
+        await update.message.reply_text("Usage: /scrape `course_id`", parse_mode="Markdown")
         return
     course_id = args[0]
     app = user_sessions.get(update.effective_user.id)
