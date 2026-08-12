@@ -1,216 +1,767 @@
-import asyncio
-import logging
 import os
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Dict
+import json
+import uuid
+import time
+import hashlib
+from pathlib import Path
+from urllib.parse import urlparse
 
+import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-from bridge_to_success_sdk import BridgeToSuccess, BTSAuthError, BTSAPIError
+# -------------------------------------------------------------------
+# Configuration
+# -------------------------------------------------------------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable not set")
 
-# ─── Logging ──────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+BASE_URL = "https://bridgetosuccess.learncentre.tech/public/study_api_v9/"
 
-# ─── In-memory sessions ─────────────────────────────────────────
-user_sessions: Dict[int, BridgeToSuccess] = {}
+# In-memory storage (per user)
+user_sessions = {}       # user_id -> BridgeToSuccessAPI instance
+user_credentials = {}    # user_id -> (mobile, password, android_id)
+user_courses = {}        # user_id -> list of course dicts (myCourses)
+user_all_courses = {}    # user_id -> list of all courses (allCourses)
+user_free_categories = {} # user_id -> list of free category dicts
 
-# ─── SDK executor ──────────────────────────────────────────────
-async def run_sdk_method(method, *args, **kwargs):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: method(*args, **kwargs))
+# -------------------------------------------------------------------
+# Helper: stable device ID per user (to avoid multiple-device warnings)
+# -------------------------------------------------------------------
+def get_device_id(user_id: int) -> str:
+    return hashlib.md5(str(user_id).encode()).hexdigest()[:16]
 
-# ─── Bot command handlers ──────────────────────────────────────
+# -------------------------------------------------------------------
+# API Client (with auto-re-login)
+# -------------------------------------------------------------------
+class BridgeToSuccessAPI:
+    def __init__(self, mobile=None, password=None, android_id=None):
+        self.base_url = BASE_URL.rstrip("/") + "/"
+        self.session = requests.Session()
+        self.user_id = None
+        self.auth_token = None
+        self.mobile = mobile
+        self.password = password
+        self.android_id = android_id or uuid.uuid4().hex[:16]
+
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36",
+            "Accept": "application/json",
+            "ktx": "co.exam.study.trend1",
+            "ktxx": "18.0",
+            "brand": "google",
+            "model": "Pixel 6",
+            "Connection": "close",
+        })
+
+    def _default_headers(self):
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36",
+            "Accept": "application/json",
+            "ktx": "co.exam.study.trend1",
+            "ktxx": "18.0",
+            "brand": "google",
+            "model": "Pixel 6",
+            "Connection": "close",
+        }
+        if self.auth_token:
+            headers["Authtoken"] = self.auth_token
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        return headers
+
+    def post(self, data, retries=3):
+        for attempt in range(retries):
+            try:
+                resp = self.session.post(self.base_url, data=data, timeout=30)
+                resp.raise_for_status()
+                if "application/json" in resp.headers.get("Content-Type", ""):
+                    return resp.json()
+                raise ValueError(f"Non-JSON response: {resp.text[:200]}")
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 401:
+                    if self.mobile and self.password and attempt < retries - 1:
+                        # Cooldown to avoid rate‑limiting
+                        if hasattr(self, 'last_login_time') and time.time() - self.last_login_time < 300:
+                            time.sleep(30)
+                        self._re_login()
+                        self.last_login_time = time.time()
+                        self.session.headers.update(self._default_headers())
+                        continue
+                    else:
+                        raise PermissionError("Token expired and re‑login failed")
+                raise
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt == retries - 1:
+                    raise
+                wait = 2 ** attempt
+                time.sleep(wait)
+                # Recreate session to reset connection
+                self.session = requests.Session()
+                self.session.headers.update(self._default_headers())
+
+    def _re_login(self):
+        data = {"tag": "login", "mobile": self.mobile, "password": self.password,
+                "androidId": self.android_id, "fcmId": ""}
+        resp = self.session.post(self.base_url, data=data, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        self._process_login_response(result)
+
+    def _process_login_response(self, obj):
+        def find(ob, keys):
+            if isinstance(ob, dict):
+                for k, v in ob.items():
+                    if k in keys and v:
+                        return v
+                    res = find(v, keys)
+                    if res:
+                        return res
+            elif isinstance(ob, list):
+                for item in ob:
+                    res = find(item, keys)
+                    if res:
+                        return res
+            return None
+        self.user_id = find(obj, ("user_id", "userId", "id"))
+        self.auth_token = find(obj, ("authToken", "auth_token", "token"))
+        if self.auth_token:
+            self.session.headers.update({
+                "Authtoken": self.auth_token,
+                "Authorization": f"Bearer {self.auth_token}"
+            })
+
+    def call(self, tag, **params):
+        return self.post({"tag": tag, **params})
+
+    # --- Authentication ---
+    def login_api(self, mobile, password, android_id="", fcm_id=""):
+        return self.call("login", mobile=mobile, password=password,
+                         androidId=android_id, fcmId=fcm_id)
+
+    # --- Profile ---
+    def get_profile(self):
+        return self.call("getProfile", userId=self.user_id)
+
+    def get_notifications(self):
+        return self.call("getNotifications", userId=self.user_id)
+
+    # --- Courses ---
+    def all_courses(self, is_ebook=False):
+        return self.call("allCourses", userId=self.user_id, isEBook=1 if is_ebook else 0)
+
+    def get_all_category(self, course_id):
+        return self.call("getAllCategory", courseId=course_id)
+
+    def all_course_video(self, category_id):
+        return self.call("allCourseVideo", categoryId=category_id, userId=self.user_id)
+
+    def all_course_pdf(self, category_id):
+        return self.call("allCoursePdf", categoryId=category_id, userId=self.user_id)
+
+    def my_courses(self, is_ebook=False):
+        return self.call("myCourses", userId=self.user_id, isEBook=1 if is_ebook else 0)
+
+    def my_course_video(self, category_id):
+        return self.call("myCourseVideo", categoryId=category_id, userId=self.user_id)
+
+    def my_course_pdf(self, category_id):
+        return self.call("myCoursePdf", categoryId=category_id, userId=self.user_id)
+
+    # --- Free content ---
+    def free_course_video(self):
+        return self.call("freeCourseVideo", userId=self.user_id)
+
+    def free_course_pdf(self):
+        return self.call("freeCoursePdf", userId=self.user_id)
+
+    def get_free_content_category(self, course_type):
+        return self.call("getFreeContentCategory", userId=self.user_id, courseType=course_type)
+
+    def get_free_content(self, course_type, category_id, page=1, page_size=20):
+        return self.call("getFreeContent", userId=self.user_id, courseType=course_type,
+                         categoryId=category_id, pageNumber=str(page), pageItemSize=str(page_size))
+
+    # --- Bulk fetch for a user (used after login) ---
+    def fetch_all_courses_with_details(self, fetch_my=False):
+        """Fetch all courses (or my courses) with full details including price."""
+        if fetch_my:
+            courses_data = self.my_courses()
+        else:
+            courses_data = self.all_courses()
+        courses = extract_courses(courses_data)
+        result = []
+        for course in courses:
+            course_id = course["courseId"]
+            course_name = course["courseName"]
+            course_price = course.get("coursePrice", "N/A")
+            strikeout_price = course.get("strikeoutPrice", None)
+            categories_data = self.get_all_category(course_id)
+            categories = extract_categories(categories_data)
+            cat_list = []
+            for cat in categories:
+                cat_id = cat["categoryId"]
+                cat_name = cat["categoryName"]
+                try:
+                    videos_data = self.all_course_video(cat_id)
+                    videos = extract_media_entries(videos_data)
+                except:
+                    videos = []
+                try:
+                    pdfs_data = self.all_course_pdf(cat_id)
+                    pdfs = extract_media_entries(pdfs_data)
+                except:
+                    pdfs = []
+                cat_list.append({
+                    "categoryId": cat_id,
+                    "categoryName": cat_name,
+                    "videos": videos,
+                    "pdfs": pdfs,
+                })
+                time.sleep(0.3)
+            result.append({
+                "courseId": course_id,
+                "courseName": course_name,
+                "coursePrice": course_price,
+                "strikeoutPrice": strikeout_price,
+                "categories": cat_list,
+            })
+        return result
+
+    def fetch_free_content_all(self):
+        free_videos = []
+        free_pdfs = []
+        try:
+            videos_data = self.free_course_video()
+            free_videos = extract_media_entries(videos_data)
+        except:
+            pass
+        try:
+            pdfs_data = self.free_course_pdf()
+            free_pdfs = extract_media_entries(pdfs_data)
+        except:
+            pass
+        return free_videos, free_pdfs
+
+# -------------------------------------------------------------------
+# Helper functions
+# -------------------------------------------------------------------
+def extract_courses(json_data):
+    """Extract course details including price."""
+    courses = []
+    def _extract(obj):
+        if isinstance(obj, dict):
+            if "courseId" in obj and "courseName" in obj:
+                course = {
+                    "courseId": obj["courseId"],
+                    "courseName": obj["courseName"],
+                    "categoryId": obj.get("categoryId") or obj["courseId"],
+                    "coursePrice": obj.get("coursePrice", "N/A"),
+                    "strikeoutPrice": obj.get("strikeoutPrice", None)
+                }
+                courses.append(course)
+            else:
+                for v in obj.values():
+                    _extract(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _extract(item)
+    _extract(json_data)
+    return courses
+
+def extract_categories(json_data):
+    cats = []
+    def _extract(obj):
+        if isinstance(obj, dict):
+            if "categoryId" in obj and "categoryName" in obj:
+                cats.append({
+                    "categoryId": obj["categoryId"],
+                    "categoryName": obj["categoryName"],
+                })
+            else:
+                for v in obj.values():
+                    _extract(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _extract(item)
+    _extract(json_data)
+    return cats
+
+def extract_media_entries(json_data):
+    entries = []
+    schema = {
+        "videoStreamURL": ["videoTitle", "title", "name"],
+        "pdfUrl": ["pdfTitle", "title", "name"],
+        "url": ["title", "name", "videoTitle", "pdfTitle"],
+        "streamURL": ["title", "videoTitle"],
+        "audioUrl": ["title", "name"],
+    }
+    def _extract(obj):
+        if isinstance(obj, dict):
+            for url_key, title_keys in schema.items():
+                if url_key in obj and obj[url_key]:
+                    url = str(obj[url_key]).strip()
+                    if not url.startswith(("http", "https")):
+                        continue
+                    title = None
+                    for tk in title_keys:
+                        if tk in obj and obj[tk]:
+                            title = str(obj[tk]).strip()
+                            break
+                    if not title:
+                        title = os.path.basename(urlparse(url).path) or "file"
+                    entries.append((url, title))
+            for v in obj.values():
+                _extract(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _extract(item)
+    _extract(json_data)
+    return entries
+
+def generate_media_text(media_entries):
+    lines = []
+    for i, (url, title) in enumerate(media_entries, 1):
+        lines.append(f"Entry {i}")
+        lines.append(f"Title: {title}")
+        lines.append(f"URL: {url}")
+        lines.append("")
+    return "\n".join(lines)
+
+def parse_selection(text, max_idx):
+    indices = []
+    for part in text.replace(" ", "").split(","):
+        if "-" in part:
+            s, e = part.split("-")
+            try:
+                s, e = int(s), int(e)
+                if s < 1 or e > max_idx or s > e:
+                    return None
+                indices.extend(range(s-1, e))
+            except ValueError:
+                return None
+        else:
+            try:
+                idx = int(part)
+                if idx < 1 or idx > max_idx:
+                    return None
+                indices.append(idx-1)
+            except ValueError:
+                return None
+    return sorted(set(indices))
+
+# -------------------------------------------------------------------
+# Telegram Bot Handlers
+# -------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Plain text – no Markdown to avoid parse errors
     await update.message.reply_text(
-        "🎓 Bridge to Success Bot\n\n"
-        "I can help you access your courses, videos, and PDFs.\n"
-        "Use /login mobile password to authenticate.\n"
-        "Then try /courses, /videos, /pdfs, /scrape, /download_pdf.\n"
-        "Use /logout to clear your session."
+        "👋 Welcome!\n\n"
+        "/login – log in with your mobile & password\n"
+        "/logout – clear your session\n"
+        "/courses – list your purchased courses\n"
+        "/allcourses – list **all** available courses with price and full content\n"
+        "/select – choose courses and export media URLs\n"
+        "/free – free content\n"
+        "/free_select <number> – export media from a free category\n"
+        "/profile – your profile info\n"
+        "/notifications – your notifications\n"
+        "/help – this message"
     )
 
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Usage: /login mobile password")
-        return
-    mobile, password = args[0], args[1]
-    store = {}
-    app = BridgeToSuccess(session_store=store, verbose=False)
-    try:
-        await run_sdk_method(app.login, mobile, password)
-        user_sessions[user_id] = app
-        await update.message.reply_text(f"✅ Logged in as {app.name} ({app.mobile})")
-    except BTSAuthError as e:
-        await update.message.reply_text(f"❌ Login failed: {e}")
-    except Exception as e:
-        logger.exception("Login error")
-        await update.message.reply_text(f"❌ Unexpected error: {e}")
+    await update.message.reply_text("Enter your mobile number (e.g., 9876543210):")
+    context.user_data["login_step"] = "mobile"
 
 async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id in user_sessions:
-        app = user_sessions.pop(user_id)
-        await run_sdk_method(app.logout)
-        await update.message.reply_text("👋 Logged out.")
+    user_sessions.pop(user_id, None)
+    user_credentials.pop(user_id, None)
+    user_courses.pop(user_id, None)
+    user_all_courses.pop(user_id, None)
+    user_free_categories.pop(user_id, None)
+    context.user_data.clear()
+    await update.message.reply_text("✅ Logged out.")
+
+async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    step = context.user_data.get("login_step")
+    if step == "mobile":
+        mobile = update.message.text.strip()
+        if not mobile.isdigit() or len(mobile) < 10:
+            await update.message.reply_text("❌ Invalid mobile.")
+            return
+        context.user_data["mobile"] = mobile
+        context.user_data["login_step"] = "password"
+        await update.message.reply_text("Now enter your password:")
+    elif step == "password":
+        password = update.message.text.strip()
+        mobile = context.user_data.get("mobile")
+        if not mobile:
+            await update.message.reply_text("❌ Session expired.")
+            return
+        android_id = get_device_id(user_id)
+        await update.message.reply_text("⏳ Logging in...")
+        try:
+            api = BridgeToSuccessAPI(mobile=mobile, password=password, android_id=android_id)
+            result = api.login_api(mobile, password, android_id, "")
+            api._process_login_response(result)
+            if api.user_id and api.auth_token:
+                user_sessions[user_id] = api
+                user_credentials[user_id] = (mobile, password, android_id)
+                context.user_data["login_step"] = None
+                await update.message.reply_text(f"✅ Login successful! User ID: {api.user_id}")
+                # Pre‑fetch all courses and purchased courses
+                await update.message.reply_text("⏳ Loading courses...")
+                try:
+                    user_all_courses[user_id] = api.fetch_all_courses_with_details(fetch_my=False)
+                    user_courses[user_id] = api.fetch_all_courses_with_details(fetch_my=True)
+                    await update.message.reply_text("✅ Courses loaded.")
+                except Exception as e:
+                    await update.message.reply_text(f"⚠️ Could not load courses: {e}")
+            else:
+                error_msg = result.get("message") or result.get("error") or "Invalid credentials"
+                await update.message.reply_text(f"❌ Login failed: {error_msg}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+        context.user_data["login_step"] = None
     else:
-        await update.message.reply_text("You are not logged in.")
+        await update.message.reply_text("Please start with /login first.")
 
 async def courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    app = user_sessions.get(update.effective_user.id)
-    if not app or not app.is_logged_in():
-        await update.message.reply_text("Please login first using /login")
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if not api:
+        await update.message.reply_text("❌ Not logged in. Use /login first.")
         return
-    try:
-        courses = await run_sdk_method(app.get_my_courses)
-        if not courses:
-            await update.message.reply_text("You are not enrolled in any courses.")
+    courses_list = user_courses.get(user_id)
+    if not courses_list:
+        await update.message.reply_text("📚 Fetching your purchased courses...")
+        try:
+            # Fetch fresh
+            data = api.my_courses()
+            courses_list = extract_courses(data)
+            if not courses_list:
+                await update.message.reply_text("No purchased courses found.")
+                return
+            user_courses[user_id] = courses_list
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
             return
-        msg = "📚 *Your Courses:*\n\n"
-        for idx, c in enumerate(courses, 1):
-            name = c.get("name") or c.get("course_name") or "Unnamed"
-            cid = c.get("id") or c.get("course_id")
-            msg += f"{idx}. [{cid}] {name}\n"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+    msg = "📖 Your Purchased Courses:\n\n"
+    for i, c in enumerate(courses_list, 1):
+        msg += f"{i}. {c['courseName']} (ID: {c['courseId']})\n"
+        if c.get('coursePrice') and c.get('strikeoutPrice'):
+            msg += f"   Price: ₹{c['coursePrice']} (Strikeout: ₹{c['strikeoutPrice']})\n"
+        elif c.get('coursePrice'):
+            msg += f"   Price: ₹{c['coursePrice']}\n"
+    msg += "\nUse /allcourses to see all available courses with price."
+    await update.message.reply_text(msg)
 
-async def videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) < 3:
-        await update.message.reply_text("Usage: /videos course_id subject_id chapter_id")
+async def allcourses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all available courses with price and full details (videos, PDFs)."""
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if not api:
+        await update.message.reply_text("❌ Not logged in. Use /login first.")
         return
-    course_id, subject_id, chapter_id = args[0], args[1], args[2]
-    app = user_sessions.get(update.effective_user.id)
-    if not app or not app.is_logged_in():
-        await update.message.reply_text("Please login first")
-        return
-    try:
-        vlist = await run_sdk_method(app.get_video_list, course_id, subject_id, chapter_id)
-        if not vlist:
-            await update.message.reply_text("No videos found.")
+    all_list = user_all_courses.get(user_id)
+    if not all_list:
+        await update.message.reply_text("📚 Fetching all available courses... This may take a moment.")
+        try:
+            all_list = api.fetch_all_courses_with_details(fetch_my=False)
+            user_all_courses[user_id] = all_list
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
             return
-        msg = "🎬 *Videos:*\n\n"
-        for v in vlist:
-            title = v.get("title") or v.get("name") or "Untitled"
-            url = v.get("play_url") or "No URL"
-            # Use inline links – Markdown is safe here
-            msg += f"• [{title}]({url})\n"
-        await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-async def pdfs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) < 3:
-        await update.message.reply_text("Usage: /pdfs course_id subject_id chapter_id")
+    if not all_list:
+        await update.message.reply_text("No courses available.")
         return
-    course_id, subject_id, chapter_id = args[0], args[1], args[2]
-    app = user_sessions.get(update.effective_user.id)
-    if not app or not app.is_logged_in():
-        await update.message.reply_text("Please login first")
+
+    # Build a detailed text file
+    lines = []
+    lines.append("=== ALL AVAILABLE COURSES ===")
+    for course in all_list:
+        lines.append(f"\n📚 {course['courseName']} (ID: {course['courseId']})")
+        if course.get('strikeoutPrice') and course.get('coursePrice') and float(course['strikeoutPrice']) > float(course['coursePrice']):
+            lines.append(f"   💰 Price: ₹{course['coursePrice']} (~~₹{course['strikeoutPrice']}~~) - {int((float(course['strikeoutPrice'])-float(course['coursePrice']))/float(course['strikeoutPrice'])*100)}% OFF")
+        elif course.get('coursePrice'):
+            lines.append(f"   💰 Price: ₹{course['coursePrice']}")
+        else:
+            lines.append("   💰 Price: N/A")
+        for cat in course.get("categories", []):
+            lines.append(f"\n  🗂️ {cat['categoryName']} (ID: {cat['categoryId']})")
+            if cat.get("videos"):
+                lines.append(f"    🎬 Videos ({len(cat['videos'])}):")
+                for vurl, vtitle in cat['videos']:
+                    lines.append(f"      - {vtitle} -> {vurl}")
+            else:
+                lines.append("    Videos: None")
+            if cat.get("pdfs"):
+                lines.append(f"    📄 PDFs ({len(cat['pdfs'])}):")
+                for purl, ptitle in cat['pdfs']:
+                    lines.append(f"      - {ptitle} -> {purl}")
+            else:
+                lines.append("    PDFs: None")
+    content = "\n".join(lines)
+    filename = f"all_courses_{user_id}.txt"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(content)
+    await update.message.reply_document(
+        document=open(filename, "rb"),
+        filename="all_courses_details.txt",
+        caption="✅ All courses with price, categories, videos, and PDFs."
+    )
+    os.remove(filename)
+
+async def select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if not api:
+        await update.message.reply_text("❌ Not logged in.")
+        return
+    courses_list = user_courses.get(user_id) or user_all_courses.get(user_id)
+    if not courses_list:
+        await update.message.reply_text("❌ No courses loaded. Use /courses or /allcourses first.")
+        return
+    await update.message.reply_text("📝 Enter course numbers (e.g., 1,3,5 or 1-5):")
+    context.user_data["select_step"] = "waiting_selection"
+
+async def handle_select_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if context.user_data.get("select_step") != "waiting_selection":
+        return
+    api = user_sessions.get(user_id)
+    if not api:
+        await update.message.reply_text("❌ Not logged in.")
+        context.user_data["select_step"] = None
+        return
+    courses_list = user_courses.get(user_id) or user_all_courses.get(user_id)
+    if not courses_list:
+        await update.message.reply_text("❌ No courses.")
+        context.user_data["select_step"] = None
+        return
+    selection_text = update.message.text.strip()
+    indices = parse_selection(selection_text, len(courses_list))
+    if indices is None:
+        await update.message.reply_text("❌ Invalid selection.")
+        return
+    selected = [courses_list[i] for i in indices]
+    await update.message.reply_text(f"✅ Selected {len(selected)} courses. Fetching media...")
+
+    all_media = []
+    for course in selected:
+        cat_id = course["categoryId"]
+        try:
+            videos = api.all_course_video(cat_id)
+            all_media.extend(extract_media_entries(videos))
+        except Exception:
+            pass
+        try:
+            pdfs = api.all_course_pdf(cat_id)
+            all_media.extend(extract_media_entries(pdfs))
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    # Free content (if any)
+    try:
+        free_v = api.free_course_video()
+        all_media.extend(extract_media_entries(free_v))
+    except:
+        pass
+    try:
+        free_p = api.free_course_pdf()
+        all_media.extend(extract_media_entries(free_p))
+    except:
+        pass
+
+    seen = set()
+    unique = []
+    for url, title in all_media:
+        if url not in seen:
+            seen.add(url)
+            unique.append((url, title))
+
+    if not unique:
+        await update.message.reply_text("No media found for selected courses.")
+        context.user_data["select_step"] = None
+        return
+
+    content = generate_media_text(unique)
+    filename = f"course_media_{user_id}.txt"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(content)
+    await update.message.reply_document(
+        document=open(filename, "rb"),
+        filename="selected_courses_media.txt",
+        caption=f"✅ {len(unique)} media entries."
+    )
+    os.remove(filename)
+    context.user_data["select_step"] = None
+
+async def free(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if not api:
+        await update.message.reply_text("❌ Not logged in. Use /login first.")
+        return
+    await update.message.reply_text("📂 Fetching free content...")
+    try:
+        # Try categories first, but fallback if they fail
+        video_cats_data = None
+        pdf_cats_data = None
+        try:
+            video_cats_data = api.get_free_content_category("video")
+        except:
+            pass
+        try:
+            pdf_cats_data = api.get_free_content_category("pdf")
+        except:
+            pass
+
+        categories = []
+        if video_cats_data:
+            video_cats = extract_categories(video_cats_data)
+            for cat in video_cats:
+                cat["type"] = "video"
+            categories.extend(video_cats)
+        if pdf_cats_data:
+            pdf_cats = extract_categories(pdf_cats_data)
+            for cat in pdf_cats:
+                cat["type"] = "pdf"
+            categories.extend(pdf_cats)
+
+        if categories:
+            user_free_categories[user_id] = categories
+            msg = "📖 Free Content Categories:\n\n"
+            for i, cat in enumerate(categories, 1):
+                msg += f"{i}. {cat['categoryName']} ({cat['type']})\n"
+            msg += "\nUse /free_select <number> to export media from a category."
+            await update.message.reply_text(msg)
+        else:
+            # Fallback: fetch all free content directly
+            await update.message.reply_text("No categories found. Fetching all free content directly...")
+            videos = api.free_course_video()
+            pdfs = api.free_course_pdf()
+            all_media = []
+            all_media.extend(extract_media_entries(videos))
+            all_media.extend(extract_media_entries(pdfs))
+            if not all_media:
+                await update.message.reply_text("No free content found.")
+                return
+            unique = list(dict.fromkeys(all_media))
+            content = generate_media_text(unique)
+            filename = f"free_media_{user_id}.txt"
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(content)
+            await update.message.reply_document(
+                document=open(filename, "rb"),
+                filename="free_content.txt",
+                caption=f"✅ Free content: {len(unique)} items."
+            )
+            os.remove(filename)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+async def free_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if not api:
+        await update.message.reply_text("❌ Not logged in.")
+        return
+    categories = user_free_categories.get(user_id)
+    if not categories:
+        await update.message.reply_text("❌ No categories found. Run /free first.")
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Please provide a category number: /free_select 1")
         return
     try:
-        plist = await run_sdk_method(app.get_pdf_list, course_id, subject_id, chapter_id)
-        if not plist:
-            await update.message.reply_text("No PDFs found.")
+        idx = int(args[0]) - 1
+        if idx < 0 or idx >= len(categories):
+            await update.message.reply_text("❌ Invalid number.")
             return
-        msg = "📄 *PDFs:*\n\n"
-        for p in plist:
-            title = p.get("title") or p.get("name") or "Untitled"
-            url = p.get("pdf_full_url") or "No URL"
-            msg += f"• [{title}]({url})\n"
-        await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-async def download_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) < 1:
-        await update.message.reply_text("Usage: /download_pdf pdf_url_or_filename")
+    except ValueError:
+        await update.message.reply_text("❌ Please enter a number.")
         return
-    url_or_name = args[0]
-    app = user_sessions.get(update.effective_user.id)
-    if not app or not app.is_logged_in():
-        await update.message.reply_text("Please login first")
-        return
-    await update.message.reply_text("⏳ Downloading PDF...")
+    cat = categories[idx]
+    cat_id = cat["categoryId"]
+    cat_type = cat["type"]
+    await update.message.reply_text(f"📥 Fetching {cat_type} content for '{cat['categoryName']}'...")
     try:
-        save_path = await run_sdk_method(app.download_pdf, url_or_name, show_progress=False)
-        with open(save_path, "rb") as f:
-            await update.message.reply_document(document=f, filename=os.path.basename(save_path))
-        os.remove(save_path)
+        content_data = api.get_free_content(cat_type, cat_id, page=1, page_size=100)
+        media_entries = extract_media_entries(content_data)
+        if not media_entries:
+            await update.message.reply_text("No media found in this category.")
+            return
+        seen = set()
+        unique = []
+        for url, title in media_entries:
+            if url not in seen:
+                seen.add(url)
+                unique.append((url, title))
+        content_text = generate_media_text(unique)
+        filename = f"free_category_{user_id}.txt"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(content_text)
+        await update.message.reply_document(
+            document=open(filename, "rb"),
+            filename=f"{cat['categoryName']}_{cat_type}.txt",
+            caption=f"✅ {len(unique)} media items in {cat['categoryName']}"
+        )
+        os.remove(filename)
     except Exception as e:
-        await update.message.reply_text(f"Download failed: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
-async def scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) < 1:
-        await update.message.reply_text("Usage: /scrape course_id")
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if not api:
+        await update.message.reply_text("❌ Not logged in. Use /login first.")
         return
-    course_id = args[0]
-    app = user_sessions.get(update.effective_user.id)
-    if not app or not app.is_logged_in():
-        await update.message.reply_text("Please login first")
-        return
-    await update.message.reply_text("⏳ Scraping course content (this may take a while)...")
     try:
-        result = await run_sdk_method(app.scrape_course, course_id)
-        msg = f"✅ Scraped *{result.get('course', '')}*\n"
-        msg += f"Videos: {len(result.get('videos', []))}\n"
-        msg += f"PDFs: {len(result.get('pdfs', []))}\n"
-        if result.get('videos'):
-            msg += "\n*Sample video:*\n" + result['videos'][0].get('play_url', 'N/A')
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        data = api.get_profile()
+        await update.message.reply_text(f"Profile info:\n```\n{json.dumps(data, indent=2)}\n```", parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
+async def notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if not api:
+        await update.message.reply_text("❌ Not logged in. Use /login first.")
+        return
+    try:
+        data = api.get_notifications()
+        await update.message.reply_text(f"Notifications:\n```\n{json.dumps(data, indent=2)}\n```", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
-# ─── Simple HTTP server for Koyeb health checks ────────────────
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❓ Unknown command. Use /start for help.")
 
-def run_http_server():
-    server = HTTPServer(("0.0.0.0", 8000), HealthHandler)
-    logger.info("Health check server running on port 8000")
-    server.serve_forever()
-
-# ─── Main ──────────────────────────────────────────────────────
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
 def main():
-    # Start HTTP server in a background thread
-    thread = threading.Thread(target=run_http_server, daemon=True)
-    thread.start()
-
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
-
-    application = Application.builder().token(token).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("login", login))
-    application.add_handler(CommandHandler("logout", logout))
-    application.add_handler(CommandHandler("courses", courses))
-    application.add_handler(CommandHandler("videos", videos))
-    application.add_handler(CommandHandler("pdfs", pdfs))
-    application.add_handler(CommandHandler("download_pdf", download_pdf))
-    application.add_handler(CommandHandler("scrape", scrape))
-
-    # Start polling (this will block)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("login", login))
+    app.add_handler(CommandHandler("logout", logout))
+    app.add_handler(CommandHandler("courses", courses))
+    app.add_handler(CommandHandler("allcourses", allcourses))
+    app.add_handler(CommandHandler("select", select))
+    app.add_handler(CommandHandler("free", free))
+    app.add_handler(CommandHandler("free_select", free_select))
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("notifications", notifications))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_input))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_input))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
+    print("🤖 Bot is running...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
