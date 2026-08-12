@@ -147,6 +147,13 @@ class BridgeToSuccessAPI:
         return self.call("login", mobile=mobile, password=password,
                          androidId=android_id, fcmId=fcm_id)
 
+    # --- Profile ---
+    def get_profile(self):
+        return self.call("getProfile", userId=self.user_id)
+
+    def get_notifications(self):
+        return self.call("getNotifications", userId=self.user_id)
+
     # --- Courses ---
     def all_courses(self, is_ebook=False):
         return self.call("allCourses", userId=self.user_id, isEBook=1 if is_ebook else 0)
@@ -395,6 +402,8 @@ async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             api = BridgeToSuccessAPI(mobile=mobile, password=password, android_id=android_id)
             result = api.login_api(mobile, password, android_id, "")
+            # CRITICAL: process the response to set user_id and auth_token
+            api._process_login_response(result)
             if api.user_id and api.auth_token:
                 user_sessions[user_id] = api
                 user_credentials[user_id] = (mobile, password, android_id)
@@ -454,7 +463,8 @@ async def courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mobile, password, android_id = user_credentials[user_id]
             api = BridgeToSuccessAPI(mobile=mobile, password=password, android_id=android_id)
             try:
-                api.login_api(mobile, password, android_id, "")
+                result = api.login_api(mobile, password, android_id, "")
+                api._process_login_response(result)
                 if api.user_id and api.auth_token:
                     user_sessions[user_id] = api
                     data = api.all_courses()
@@ -527,7 +537,8 @@ async def handle_select_input(update: Update, context: ContextTypes.DEFAULT_TYPE
                 mobile, password, android_id = user_credentials[user_id]
                 api = BridgeToSuccessAPI(mobile=mobile, password=password, android_id=android_id)
                 try:
-                    api.login_api(mobile, password, android_id, "")
+                    result = api.login_api(mobile, password, android_id, "")
+                    api._process_login_response(result)
                     if api.user_id and api.auth_token:
                         user_sessions[user_id] = api
                         videos = api.all_course_video(cat_id)
@@ -590,7 +601,7 @@ async def handle_select_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     os.remove(filename)
     context.user_data["select_step"] = None
 
-# Additional commands (free, free_select, allcourses, withoutlogin, profile, notifications)
+# --- Free content commands ---
 async def free(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
@@ -709,6 +720,7 @@ async def free_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
+# --- All courses dump ---
 async def allcourses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
@@ -822,6 +834,7 @@ async def allcourses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
+# --- Without login (cached) ---
 async def withoutlogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not cached_data_loaded:
         await update.message.reply_text("❌ No cached data available. Master credentials may be missing or cache not loaded.")
@@ -867,6 +880,7 @@ async def withoutlogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     os.remove(filename)
 
+# --- Profile & Notifications ---
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
