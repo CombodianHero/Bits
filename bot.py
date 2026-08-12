@@ -362,6 +362,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Welcome to BridgeToSuccess Bot!\n\n"
         "Commands:\n"
         "/login – log in with mobile & password\n"
+        "/logout – clear your session\n"
         "/courses – list all courses (uses cache if available)\n"
         "/select – choose course(s) and export media URLs\n"
         "/free – list free content categories\n"
@@ -379,6 +380,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Enter your mobile number (e.g., 9876543210):")
     context.user_data["login_step"] = "mobile"
+
+async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    # Clear all stored data for this user
+    user_sessions.pop(user_id, None)
+    user_credentials.pop(user_id, None)
+    user_courses.pop(user_id, None)
+    user_free_categories.pop(user_id, None)
+    # Also clear any login/select steps
+    context.user_data.clear()
+    await update.message.reply_text("✅ You have been logged out.")
 
 async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -601,7 +613,7 @@ async def handle_select_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     os.remove(filename)
     context.user_data["select_step"] = None
 
-# --- Free content commands ---
+# --- Free content commands (fixed) ---
 async def free(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
@@ -625,20 +637,42 @@ async def free(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Not logged in and no cached free content. Use /login first.")
         return
 
-    await update.message.reply_text("📂 Fetching free content categories...")
+    await update.message.reply_text("📂 Fetching free content...")
     try:
-        video_cats_data = api.get_free_content_category("video")
-        pdf_cats_data = api.get_free_content_category("pdf")
+        # Attempt to fetch categories, but if they fail, we fall back to direct fetch
+        video_cats_data = None
+        pdf_cats_data = None
+        try:
+            video_cats_data = api.get_free_content_category("video")
+        except Exception:
+            pass
+        try:
+            pdf_cats_data = api.get_free_content_category("pdf")
+        except Exception:
+            pass
+
         categories = []
-        video_cats = extract_categories(video_cats_data) if video_cats_data else []
-        for cat in video_cats:
-            cat["type"] = "video"
-        categories.extend(video_cats)
-        pdf_cats = extract_categories(pdf_cats_data) if pdf_cats_data else []
-        for cat in pdf_cats:
-            cat["type"] = "pdf"
-        categories.extend(pdf_cats)
-        if not categories:
+        if video_cats_data:
+            video_cats = extract_categories(video_cats_data)
+            for cat in video_cats:
+                cat["type"] = "video"
+            categories.extend(video_cats)
+        if pdf_cats_data:
+            pdf_cats = extract_categories(pdf_cats_data)
+            for cat in pdf_cats:
+                cat["type"] = "pdf"
+            categories.extend(pdf_cats)
+
+        # If we have categories, present them; otherwise fetch all free content directly
+        if categories:
+            user_free_categories[user_id] = categories
+            msg = "📖 Free Content Categories:\n\n"
+            for i, cat in enumerate(categories, 1):
+                msg += f"{i}. {cat['categoryName']} ({cat['type']})\n"
+            msg += "\nUse /free_select <number> to export media from a category."
+            await update.message.reply_text(msg)
+        else:
+            # Fallback: fetch all free content directly
             await update.message.reply_text("No categories found. Fetching all free content directly...")
             videos = api.free_course_video()
             pdfs = api.free_course_pdf()
@@ -659,13 +693,6 @@ async def free(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=f"✅ Free content: {len(unique)} items."
             )
             os.remove(filename)
-            return
-        user_free_categories[user_id] = categories
-        msg = "📖 Free Content Categories:\n\n"
-        for i, cat in enumerate(categories, 1):
-            msg += f"{i}. {cat['categoryName']} ({cat['type']})\n"
-        msg += "\nUse /free_select <number> to export media from a category."
-        await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
@@ -921,6 +948,7 @@ def main():
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("help", help_command))
         app.add_handler(CommandHandler("login", login))
+        app.add_handler(CommandHandler("logout", logout))
         app.add_handler(CommandHandler("courses", courses))
         app.add_handler(CommandHandler("select", select))
         app.add_handler(CommandHandler("free", free))
