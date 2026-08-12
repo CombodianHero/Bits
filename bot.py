@@ -3,12 +3,22 @@ import json
 import uuid
 import time
 import hashlib
+import logging
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# -------------------------------------------------------------------
+# Logging
+# -------------------------------------------------------------------
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # -------------------------------------------------------------------
 # Configuration
@@ -33,7 +43,7 @@ def get_device_id(user_id: int) -> str:
     return hashlib.md5(str(user_id).encode()).hexdigest()[:16]
 
 # -------------------------------------------------------------------
-# API Client (with auto-re-login)
+# API Client (with auto-re-login and logging)
 # -------------------------------------------------------------------
 class BridgeToSuccessAPI:
     def __init__(self, mobile=None, password=None, android_id=None):
@@ -54,6 +64,8 @@ class BridgeToSuccessAPI:
             "model": "Pixel 6",
             "Connection": "close",
         })
+        self.last_login_time = 0
+        logger.info(f"API client initialized for user: {mobile}")
 
     def _default_headers(self):
         headers = {
@@ -80,15 +92,17 @@ class BridgeToSuccessAPI:
                 raise ValueError(f"Non-JSON response: {resp.text[:200]}")
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 401:
+                    logger.warning(f"401 Unauthorized. Attempt {attempt+1}/{retries}")
                     if self.mobile and self.password and attempt < retries - 1:
                         # Cooldown to avoid rate‑limiting
-                        if hasattr(self, 'last_login_time') and time.time() - self.last_login_time < 300:
+                        if time.time() - self.last_login_time < 300:
                             time.sleep(30)
                         self._re_login()
                         self.last_login_time = time.time()
                         self.session.headers.update(self._default_headers())
                         continue
                     else:
+                        logger.error("Token expired and re‑login failed or no credentials.")
                         raise PermissionError("Token expired and re‑login failed")
                 raise
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
@@ -101,12 +115,14 @@ class BridgeToSuccessAPI:
                 self.session.headers.update(self._default_headers())
 
     def _re_login(self):
+        logger.info("Attempting auto-re-login...")
         data = {"tag": "login", "mobile": self.mobile, "password": self.password,
                 "androidId": self.android_id, "fcmId": ""}
         resp = self.session.post(self.base_url, data=data, timeout=30)
         resp.raise_for_status()
         result = resp.json()
         self._process_login_response(result)
+        logger.info("Auto-re-login successful.")
 
     def _process_login_response(self, obj):
         def find(ob, keys):
@@ -130,23 +146,24 @@ class BridgeToSuccessAPI:
                 "Authtoken": self.auth_token,
                 "Authorization": f"Bearer {self.auth_token}"
             })
+            logger.info(f"Token updated for user {self.user_id}")
+        else:
+            logger.warning("No auth_token found in login response.")
 
     def call(self, tag, **params):
         return self.post({"tag": tag, **params})
 
-    # --- Authentication ---
+    # --- All API methods (same as before) ---
     def login_api(self, mobile, password, android_id="", fcm_id=""):
         return self.call("login", mobile=mobile, password=password,
                          androidId=android_id, fcmId=fcm_id)
 
-    # --- Profile ---
     def get_profile(self):
         return self.call("getProfile", userId=self.user_id)
 
     def get_notifications(self):
         return self.call("getNotifications", userId=self.user_id)
 
-    # --- Courses ---
     def all_courses(self, is_ebook=False):
         return self.call("allCourses", userId=self.user_id, isEBook=1 if is_ebook else 0)
 
@@ -168,7 +185,6 @@ class BridgeToSuccessAPI:
     def my_course_pdf(self, category_id):
         return self.call("myCoursePdf", categoryId=category_id, userId=self.user_id)
 
-    # --- Free content ---
     def free_course_video(self):
         return self.call("freeCourseVideo", userId=self.user_id)
 
@@ -182,9 +198,7 @@ class BridgeToSuccessAPI:
         return self.call("getFreeContent", userId=self.user_id, courseType=course_type,
                          categoryId=category_id, pageNumber=str(page), pageItemSize=str(page_size))
 
-    # --- Bulk fetch for a user (used after login) ---
     def fetch_all_courses_with_details(self, fetch_my=False):
-        """Fetch all courses (or my courses) with full details including price."""
         if fetch_my:
             courses_data = self.my_courses()
         else:
@@ -244,10 +258,9 @@ class BridgeToSuccessAPI:
         return free_videos, free_pdfs
 
 # -------------------------------------------------------------------
-# Helper functions
+# Helper functions (same as before)
 # -------------------------------------------------------------------
 def extract_courses(json_data):
-    """Extract course details including price."""
     courses = []
     def _extract(obj):
         if isinstance(obj, dict):
@@ -365,8 +378,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/free_select <number> – export media from a free category\n"
         "/profile – your profile info\n"
         "/notifications – your notifications\n"
+        "/session – check your current session status\n"
         "/help – this message"
     )
+
+async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if api and api.auth_token:
+        await update.message.reply_text(
+            f"✅ Session active.\n"
+            f"User ID: {api.user_id}\n"
+            f"Token: {'Present' if api.auth_token else 'Missing'}\n"
+            f"Mobile: {api.mobile}"
+        )
+    else:
+        await update.message.reply_text("❌ No active session. Use /login.")
 
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Enter your mobile number (e.g., 9876543210):")
@@ -380,6 +407,7 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_all_courses.pop(user_id, None)
     user_free_categories.pop(user_id, None)
     context.user_data.clear()
+    logger.info(f"User {user_id} logged out manually.")
     await update.message.reply_text("✅ Logged out.")
 
 async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -416,12 +444,16 @@ async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     user_all_courses[user_id] = api.fetch_all_courses_with_details(fetch_my=False)
                     user_courses[user_id] = api.fetch_all_courses_with_details(fetch_my=True)
                     await update.message.reply_text("✅ Courses loaded.")
+                    logger.info(f"User {user_id} logged in and courses loaded.")
                 except Exception as e:
+                    logger.error(f"Course loading failed for user {user_id}: {e}")
                     await update.message.reply_text(f"⚠️ Could not load courses: {e}")
             else:
                 error_msg = result.get("message") or result.get("error") or "Invalid credentials"
+                logger.warning(f"Login failed for user {user_id}: {error_msg}")
                 await update.message.reply_text(f"❌ Login failed: {error_msg}")
         except Exception as e:
+            logger.error(f"Login error for user {user_id}: {e}")
             await update.message.reply_text(f"❌ Error: {str(e)}")
         context.user_data["login_step"] = None
     else:
@@ -437,14 +469,19 @@ async def courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not courses_list:
         await update.message.reply_text("📚 Fetching your purchased courses...")
         try:
-            # Fetch fresh
             data = api.my_courses()
             courses_list = extract_courses(data)
             if not courses_list:
                 await update.message.reply_text("No purchased courses found.")
                 return
             user_courses[user_id] = courses_list
+        except PermissionError as e:
+            # Token expired – re‑login already attempted in post()
+            # If it still fails, tell user to re‑login manually.
+            await update.message.reply_text(f"❌ Session expired. Please /login again.")
+            return
         except Exception as e:
+            logger.error(f"Error in courses for user {user_id}: {e}")
             await update.message.reply_text(f"❌ Error: {str(e)}")
             return
     msg = "📖 Your Purchased Courses:\n\n"
@@ -458,7 +495,6 @@ async def courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def allcourses(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show all available courses with price and full details (videos, PDFs)."""
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
     if not api:
@@ -470,20 +506,24 @@ async def allcourses(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             all_list = api.fetch_all_courses_with_details(fetch_my=False)
             user_all_courses[user_id] = all_list
+        except PermissionError:
+            await update.message.reply_text("❌ Session expired. Please /login again.")
+            return
         except Exception as e:
+            logger.error(f"Error in allcourses for user {user_id}: {e}")
             await update.message.reply_text(f"❌ Error: {str(e)}")
             return
     if not all_list:
         await update.message.reply_text("No courses available.")
         return
 
-    # Build a detailed text file
     lines = []
     lines.append("=== ALL AVAILABLE COURSES ===")
     for course in all_list:
         lines.append(f"\n📚 {course['courseName']} (ID: {course['courseId']})")
         if course.get('strikeoutPrice') and course.get('coursePrice') and float(course['strikeoutPrice']) > float(course['coursePrice']):
-            lines.append(f"   💰 Price: ₹{course['coursePrice']} (~~₹{course['strikeoutPrice']}~~) - {int((float(course['strikeoutPrice'])-float(course['coursePrice']))/float(course['strikeoutPrice'])*100)}% OFF")
+            discount = int((float(course['strikeoutPrice'])-float(course['coursePrice']))/float(course['strikeoutPrice'])*100)
+            lines.append(f"   💰 Price: ₹{course['coursePrice']} (~~₹{course['strikeoutPrice']}~~) - {discount}% OFF")
         elif course.get('coursePrice'):
             lines.append(f"   💰 Price: ₹{course['coursePrice']}")
         else:
@@ -607,7 +647,6 @@ async def free(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("📂 Fetching free content...")
     try:
-        # Try categories first, but fallback if they fail
         video_cats_data = None
         pdf_cats_data = None
         try:
@@ -639,7 +678,6 @@ async def free(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "\nUse /free_select <number> to export media from a category."
             await update.message.reply_text(msg)
         else:
-            # Fallback: fetch all free content directly
             await update.message.reply_text("No categories found. Fetching all free content directly...")
             videos = api.free_course_video()
             pdfs = api.free_course_pdf()
@@ -660,7 +698,10 @@ async def free(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=f"✅ Free content: {len(unique)} items."
             )
             os.remove(filename)
+    except PermissionError:
+        await update.message.reply_text("❌ Session expired. Please /login again.")
     except Exception as e:
+        logger.error(f"Error in free for user {user_id}: {e}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def free_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -711,7 +752,10 @@ async def free_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=f"✅ {len(unique)} media items in {cat['categoryName']}"
         )
         os.remove(filename)
+    except PermissionError:
+        await update.message.reply_text("❌ Session expired. Please /login again.")
     except Exception as e:
+        logger.error(f"Error in free_select for user {user_id}: {e}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -723,7 +767,10 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = api.get_profile()
         await update.message.reply_text(f"Profile info:\n```\n{json.dumps(data, indent=2)}\n```", parse_mode="Markdown")
+    except PermissionError:
+        await update.message.reply_text("❌ Session expired. Please /login again.")
     except Exception as e:
+        logger.error(f"Error in profile for user {user_id}: {e}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -735,7 +782,10 @@ async def notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = api.get_notifications()
         await update.message.reply_text(f"Notifications:\n```\n{json.dumps(data, indent=2)}\n```", parse_mode="Markdown")
+    except PermissionError:
+        await update.message.reply_text("❌ Session expired. Please /login again.")
     except Exception as e:
+        logger.error(f"Error in notifications for user {user_id}: {e}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -750,6 +800,7 @@ def main():
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("login", login))
     app.add_handler(CommandHandler("logout", logout))
+    app.add_handler(CommandHandler("session", session_command))
     app.add_handler(CommandHandler("courses", courses))
     app.add_handler(CommandHandler("allcourses", allcourses))
     app.add_handler(CommandHandler("select", select))
