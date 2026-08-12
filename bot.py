@@ -1,970 +1,892 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║     BRIDGE TO SUCCESS — Complete Python SDK                     ║
+║     Mirrors the full app flow: Login → Courses → Video/PDF     ║
+║     API Base: study_api_v9                                      ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Usage:
+    from bridge_to_success_sdk import BridgeToSuccess
+    
+    app = BridgeToSuccess()
+    app.login("9999999999", "password")
+    courses = app.get_my_courses()
+    videos  = app.get_videos(course_id=1, subject_id=2, chapter_id=3)
+    app.download_pdf("chapter1.pdf", "output.pdf")
+"""
+
 import os
 import json
-import uuid
 import time
+import requests
 import hashlib
 from pathlib import Path
-from urllib.parse import urlparse
+from typing import Optional
 
-import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# -------------------------------------------------------------------
-# Configuration
-# -------------------------------------------------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable not set")
+# ─────────────────────────────────────────────────────────────────
+# CONSTANTS (from APK DEX analysis)
+# ─────────────────────────────────────────────────────────────────
 
-BASE_URL = "https://bridgetosuccess.learncentre.tech/public/study_api_v9/"
+BASE_URL  = "https://bridgetosuccess.learncentre.tech"
+API_BASE  = f"{BASE_URL}/public/study_api_v9/"
 
-# Master account credentials (enable /withoutlogin)
-MASTER_MOBILE = os.environ.get("MASTER_MOBILE", "")
-MASTER_PASSWORD = os.environ.get("MASTER_PASSWORD", "")
-MASTER_ANDROID_ID = os.environ.get("MASTER_ANDROID_ID", "0000000000000000")
+STORAGE = {
+    "video"       : f"{BASE_URL}/public/storage/video/",
+    "pdf"         : f"{BASE_URL}/public/storage/pdf/",
+    "banner"      : f"{BASE_URL}/public/storage/banner/",
+    "category"    : f"{BASE_URL}/public/storage/category/",
+    "course"      : f"{BASE_URL}/public/storage/course/",
+    "profile"     : f"{BASE_URL}/public/storage/profile_image/",
+    "question"    : f"{BASE_URL}/public/storage/question/",
+    "timetable"   : f"{BASE_URL}/public/storage/timetable/",
+    "top_student" : f"{BASE_URL}/public/storage/top_student/",
+    "top_teacher" : f"{BASE_URL}/public/storage/top_teacher/",
+    "stream"      : f"{BASE_URL}/public/storage/stream/",
+    "ticket"      : f"{BASE_URL}/public/storage/ticket/",
+    "frame"       : f"{BASE_URL}/public/storage/frame/",
+    "social"      : f"{BASE_URL}/public/storage/social/",
+    "event"       : f"{BASE_URL}/public/storage/event/",
+}
 
-# In-memory storage
-user_sessions = {}          # user_id -> BridgeToSuccessAPI instance
-user_credentials = {}       # user_id -> (mobile, password, android_id)
-user_courses = {}           # user_id -> list of course dicts
-user_free_categories = {}   # user_id -> list of free category dicts
+PLAYER_URL      = "https://lctplayer.learncentre.online/v/player.php?v="
+LIVE_PLAYER_URL = "https://lctplayer.learncentre.online/live/live_player.php?v="
+TEST_URL        = f"{BASE_URL}/attempt-test/%s?user_id=%s"
+TEST_ANSWER_URL = f"{BASE_URL}/view-test-answers/%s?user_id=%s"
+PDF_WEB_URL     = f"{BASE_URL}/pdf-page?name="
 
-# Master cache for without-login mode
-cached_courses = []
-cached_free_videos = []
-cached_free_pdfs = []
-cached_data_loaded = False
+DEVICE_INFO = {
+    "device_id"      : "python-sdk-001",
+    "device_token"   : "fcm_placeholder",
+    "device_type"    : "android",
+    "device_model"   : "Pixel 6",
+    "platform"       : "android",
+    "source"         : "app",
+    "app_version"    : "1.0",
+    "version_code"   : "1",
+    "os_version"     : "13",
+    "android_version": "13",
+    "registration_id": "fcm_placeholder",
+}
 
-# -------------------------------------------------------------------
-# Helper to generate stable device ID per user
-# -------------------------------------------------------------------
-def get_device_id(user_id: int) -> str:
-    return hashlib.md5(str(user_id).encode()).hexdigest()[:16]
+SESSION_FILE = "bts_session.json"
 
-# -------------------------------------------------------------------
-# API Client (with auto-re-login)
-# -------------------------------------------------------------------
-class BridgeToSuccessAPI:
-    def __init__(self, mobile=None, password=None, android_id=None):
-        self.base_url = BASE_URL.rstrip("/") + "/"
-        self.session = requests.Session()
-        self.user_id = None
-        self.auth_token = None
-        self.mobile = mobile
-        self.password = password
-        self.android_id = android_id or uuid.uuid4().hex[:16]
 
+# ─────────────────────────────────────────────────────────────────
+# EXCEPTIONS
+# ─────────────────────────────────────────────────────────────────
+
+class BTSError(Exception):          pass
+class BTSAuthError(BTSError):       pass
+class BTSNotFoundError(BTSError):   pass
+class BTSAPIError(BTSError):        pass
+
+
+# ─────────────────────────────────────────────────────────────────
+# MAIN SDK CLASS
+# ─────────────────────────────────────────────────────────────────
+
+class BridgeToSuccess:
+    """
+    Complete Python SDK for Bridge to Success app.
+    Mirrors the full app flow from SplashActivity to video/PDF play.
+    """
+
+    def __init__(self, session_file: str = SESSION_FILE, verbose: bool = True):
+        self.session_file = session_file
+        self.verbose      = verbose
+        self.token        = None
+        self.user_id      = None
+        self.name         = None
+        self.mobile       = None
+        self.session      = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36",
-            "Accept": "application/json",
-            "ktx": "co.exam.study.trend1",
-            "ktxx": "18.0",
-            "brand": "google",
-            "model": "Pixel 6",
-            "Connection": "close",
+            "Content-Type": "application/json",
+            "Accept"      : "application/json",
+            "User-Agent"  : "okhttp/4.9.3",
         })
+        # Try to restore saved session (like app reading SharedPreferences)
+        self._load_session()
 
-    def _default_headers(self):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36",
-            "Accept": "application/json",
-            "ktx": "co.exam.study.trend1",
-            "ktxx": "18.0",
-            "brand": "google",
-            "model": "Pixel 6",
-            "Connection": "close",
+    # ── LOGGING ──────────────────────────────────────────────────
+    def _log(self, msg: str):
+        if self.verbose:
+            print(f"[BTS] {msg}")
+
+    # ── SESSION (mirrors SharedPreferences) ──────────────────────
+    def _save_session(self):
+        """Save session to file (mirrors SharedPreferences on Android)."""
+        data = {
+            "token"  : self.token,
+            "user_id": self.user_id,
+            "name"   : self.name,
+            "mobile" : self.mobile,
         }
-        if self.auth_token:
-            headers["Authtoken"] = self.auth_token
-            headers["Authorization"] = f"Bearer {self.auth_token}"
-        return headers
+        with open(self.session_file, "w") as f:
+            json.dump(data, f, indent=2)
+        self._log(f"Session saved to {self.session_file}")
 
-    def post(self, data, retries=3):
-        for attempt in range(retries):
+    def _load_session(self):
+        """Load saved session (mirrors app reading SharedPreferences at startup)."""
+        if os.path.exists(self.session_file):
             try:
-                resp = self.session.post(self.base_url, data=data, timeout=30)
-                resp.raise_for_status()
-                if "application/json" in resp.headers.get("Content-Type", ""):
-                    return resp.json()
-                raise ValueError(f"Non-JSON response: {resp.text[:200]}")
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 401:
-                    if self.mobile and self.password and attempt < retries - 1:
-                        if hasattr(self, 'last_login_time') and time.time() - self.last_login_time < 300:
-                            time.sleep(30)
-                        self._re_login()
-                        self.last_login_time = time.time()
-                        self.session.headers.update(self._default_headers())
-                        continue
-                    else:
-                        raise PermissionError("Token expired and re‑login failed")
-                raise
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                if attempt == retries - 1:
-                    raise
-                wait = 2 ** attempt
-                time.sleep(wait)
-                self.session = requests.Session()
-                self.session.headers.update(self._default_headers())
-
-    def _re_login(self):
-        data = {"tag": "login", "mobile": self.mobile, "password": self.password,
-                "androidId": self.android_id, "fcmId": ""}
-        resp = self.session.post(self.base_url, data=data, timeout=30)
-        resp.raise_for_status()
-        result = resp.json()
-        self._process_login_response(result)
-
-    def _process_login_response(self, obj):
-        def find(ob, keys):
-            if isinstance(ob, dict):
-                for k, v in ob.items():
-                    if k in keys and v:
-                        return v
-                    res = find(v, keys)
-                    if res:
-                        return res
-            elif isinstance(ob, list):
-                for item in ob:
-                    res = find(item, keys)
-                    if res:
-                        return res
-            return None
-        self.user_id = find(obj, ("user_id", "userId", "id"))
-        self.auth_token = find(obj, ("authToken", "auth_token", "token"))
-        if self.auth_token:
-            self.session.headers.update({
-                "Authtoken": self.auth_token,
-                "Authorization": f"Bearer {self.auth_token}"
-            })
-
-    def call(self, tag, **params):
-        return self.post({"tag": tag, **params})
-
-    # --- Auth ---
-    def login_api(self, mobile, password, android_id="", fcm_id=""):
-        return self.call("login", mobile=mobile, password=password,
-                         androidId=android_id, fcmId=fcm_id)
-
-    # --- Profile ---
-    def get_profile(self):
-        return self.call("getProfile", userId=self.user_id)
-
-    def get_notifications(self):
-        return self.call("getNotifications", userId=self.user_id)
-
-    # --- Courses ---
-    def all_courses(self, is_ebook=False):
-        return self.call("allCourses", userId=self.user_id, isEBook=1 if is_ebook else 0)
-
-    def get_all_category(self, course_id):
-        return self.call("getAllCategory", courseId=course_id)
-
-    def all_course_video(self, category_id):
-        return self.call("allCourseVideo", categoryId=category_id, userId=self.user_id)
-
-    def all_course_pdf(self, category_id):
-        return self.call("allCoursePdf", categoryId=category_id, userId=self.user_id)
-
-    # --- Free content ---
-    def free_course_video(self):
-        return self.call("freeCourseVideo", userId=self.user_id)
-
-    def free_course_pdf(self):
-        return self.call("freeCoursePdf", userId=self.user_id)
-
-    def get_free_content_category(self, course_type):
-        return self.call("getFreeContentCategory", userId=self.user_id, courseType=course_type)
-
-    def get_free_content(self, course_type, category_id, page=1, page_size=20):
-        return self.call("getFreeContent", userId=self.user_id, courseType=course_type,
-                         categoryId=category_id, pageNumber=str(page), pageItemSize=str(page_size))
-
-    # --- Bulk fetch for master caching ---
-    def fetch_all_courses_with_details(self):
-        courses_data = self.all_courses()
-        courses = extract_courses(courses_data)
-        result = []
-        for course in courses:
-            course_id = course["courseId"]
-            course_name = course["courseName"]
-            categories_data = self.get_all_category(course_id)
-            categories = extract_categories(categories_data)
-            cat_list = []
-            for cat in categories:
-                cat_id = cat["categoryId"]
-                cat_name = cat["categoryName"]
-                try:
-                    videos_data = self.all_course_video(cat_id)
-                    videos = extract_media_entries(videos_data)
-                except:
-                    videos = []
-                try:
-                    pdfs_data = self.all_course_pdf(cat_id)
-                    pdfs = extract_media_entries(pdfs_data)
-                except:
-                    pdfs = []
-                cat_list.append({
-                    "categoryId": cat_id,
-                    "categoryName": cat_name,
-                    "videos": videos,
-                    "pdfs": pdfs,
-                })
-                time.sleep(0.3)
-            result.append({
-                "courseId": course_id,
-                "courseName": course_name,
-                "categories": cat_list,
-            })
-        return result
-
-    def fetch_free_content_all(self):
-        free_videos = []
-        free_pdfs = []
-        try:
-            videos_data = self.free_course_video()
-            free_videos = extract_media_entries(videos_data)
-        except:
-            pass
-        try:
-            pdfs_data = self.free_course_pdf()
-            free_pdfs = extract_media_entries(pdfs_data)
-        except:
-            pass
-        return free_videos, free_pdfs
-
-# -------------------------------------------------------------------
-# Helper functions
-# -------------------------------------------------------------------
-def extract_courses(json_data):
-    courses = []
-    def _extract(obj):
-        if isinstance(obj, dict):
-            if "courseId" in obj and "courseName" in obj:
-                courses.append({
-                    "courseId": obj["courseId"],
-                    "courseName": obj["courseName"],
-                    "categoryId": obj.get("categoryId") or obj["courseId"]
-                })
-            else:
-                for v in obj.values():
-                    _extract(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                _extract(item)
-    _extract(json_data)
-    return courses
-
-def extract_categories(json_data):
-    cats = []
-    def _extract(obj):
-        if isinstance(obj, dict):
-            if "categoryId" in obj and "categoryName" in obj:
-                cats.append({
-                    "categoryId": obj["categoryId"],
-                    "categoryName": obj["categoryName"],
-                })
-            else:
-                for v in obj.values():
-                    _extract(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                _extract(item)
-    _extract(json_data)
-    return cats
-
-def extract_media_entries(json_data):
-    entries = []
-    schema = {
-        "videoStreamURL": ["videoTitle", "title", "name"],
-        "pdfUrl": ["pdfTitle", "title", "name"],
-        "url": ["title", "name", "videoTitle", "pdfTitle"],
-        "streamURL": ["title", "videoTitle"],
-        "audioUrl": ["title", "name"],
-    }
-    def _extract(obj):
-        if isinstance(obj, dict):
-            for url_key, title_keys in schema.items():
-                if url_key in obj and obj[url_key]:
-                    url = str(obj[url_key]).strip()
-                    if not url.startswith(("http", "https")):
-                        continue
-                    title = None
-                    for tk in title_keys:
-                        if tk in obj and obj[tk]:
-                            title = str(obj[tk]).strip()
-                            break
-                    if not title:
-                        title = os.path.basename(urlparse(url).path) or "file"
-                    entries.append((url, title))
-            for v in obj.values():
-                _extract(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                _extract(item)
-    _extract(json_data)
-    return entries
-
-def generate_media_text(media_entries):
-    lines = []
-    for i, (url, title) in enumerate(media_entries, 1):
-        lines.append(f"Entry {i}")
-        lines.append(f"Title: {title}")
-        lines.append(f"URL: {url}")
-        lines.append("")
-    return "\n".join(lines)
-
-def parse_selection(text, max_idx):
-    indices = []
-    for part in text.replace(" ", "").split(","):
-        if "-" in part:
-            s, e = part.split("-")
-            try:
-                s, e = int(s), int(e)
-                if s < 1 or e > max_idx or s > e:
-                    return None
-                indices.extend(range(s-1, e))
-            except ValueError:
-                return None
-        else:
-            try:
-                idx = int(part)
-                if idx < 1 or idx > max_idx:
-                    return None
-                indices.append(idx-1)
-            except ValueError:
-                return None
-    return sorted(set(indices))
-
-def load_master_data():
-    global cached_courses, cached_free_videos, cached_free_pdfs, cached_data_loaded
-    if not MASTER_MOBILE or not MASTER_PASSWORD:
-        print("Master credentials not set – skipping cache load.")
-        return False
-    try:
-        api = BridgeToSuccessAPI(mobile=MASTER_MOBILE, password=MASTER_PASSWORD, android_id=MASTER_ANDROID_ID)
-        api.login_api(MASTER_MOBILE, MASTER_PASSWORD, MASTER_ANDROID_ID, "")
-        cached_courses = api.fetch_all_courses_with_details()
-        cached_free_videos, cached_free_pdfs = api.fetch_free_content_all()
-        cached_data_loaded = True
-        print(f"✅ Master cache loaded: {len(cached_courses)} courses, {len(cached_free_videos)} free videos, {len(cached_free_pdfs)} free PDFs.")
-        return True
-    except Exception as e:
-        print(f"❌ Failed to load master cache: {e}")
-        return False
-
-# -------------------------------------------------------------------
-# Telegram Bot Handlers
-# -------------------------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome to BridgeToSuccess Bot!\n\n"
-        "Commands:\n"
-        "/login – log in with mobile & password\n"
-        "/logout – clear your session\n"
-        "/courses – list all courses (uses cache if available)\n"
-        "/select – choose course(s) and export media URLs\n"
-        "/free – list free content categories\n"
-        "/free_select <number> – export media from a free category\n"
-        "/allcourses – get a full dump of all courses with contents\n"
-        "/withoutlogin – get all cached data without login (if master cache enabled)\n"
-        "/profile – view your profile (login required)\n"
-        "/notifications – fetch notifications\n"
-        "/help – show this message"
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
-
-async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Enter your mobile number (e.g., 9876543210):")
-    context.user_data["login_step"] = "mobile"
-
-async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    # Clear all stored data for this user
-    user_sessions.pop(user_id, None)
-    user_credentials.pop(user_id, None)
-    user_courses.pop(user_id, None)
-    user_free_categories.pop(user_id, None)
-    # Also clear any login/select steps
-    context.user_data.clear()
-    await update.message.reply_text("✅ You have been logged out.")
-
-async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    step = context.user_data.get("login_step")
-    if step == "mobile":
-        mobile = update.message.text.strip()
-        if not mobile.isdigit() or len(mobile) < 10:
-            await update.message.reply_text("❌ Invalid mobile. Please enter a 10-digit number.")
-            return
-        context.user_data["mobile"] = mobile
-        context.user_data["login_step"] = "password"
-        await update.message.reply_text("Now enter your password:")
-    elif step == "password":
-        password = update.message.text.strip()
-        mobile = context.user_data.get("mobile")
-        if not mobile:
-            await update.message.reply_text("❌ Session expired. Please start over with /login")
-            return
-        android_id = get_device_id(user_id)   # stable per user
-        await update.message.reply_text("⏳ Logging in...")
-        try:
-            api = BridgeToSuccessAPI(mobile=mobile, password=password, android_id=android_id)
-            result = api.login_api(mobile, password, android_id, "")
-            # CRITICAL: process the response to set user_id and auth_token
-            api._process_login_response(result)
-            if api.user_id and api.auth_token:
-                user_sessions[user_id] = api
-                user_credentials[user_id] = (mobile, password, android_id)
-                context.user_data["login_step"] = None
-                await update.message.reply_text(f"✅ Login successful!\nUser ID: {api.user_id}")
-                # Pre-fetch courses
-                await update.message.reply_text("⏳ Fetching courses...")
-                try:
-                    user_courses[user_id] = api.fetch_all_courses_with_details()
-                    await update.message.reply_text("✅ Courses cached.")
-                except Exception as e:
-                    await update.message.reply_text(f"⚠️ Could not fetch courses: {e}")
-            else:
-                # Extract error message from server response
-                error_msg = result.get("message") or result.get("error") or result.get("msg") or "Invalid credentials"
-                await update.message.reply_text(f"❌ Login failed: {error_msg}")
-        except requests.exceptions.HTTPError as e:
-            try:
-                error_data = e.response.json()
-                error_msg = error_data.get("message") or error_data.get("error") or str(e)
+                with open(self.session_file) as f:
+                    data = json.load(f)
+                self.token   = data.get("token")
+                self.user_id = data.get("user_id")
+                self.name    = data.get("name")
+                self.mobile  = data.get("mobile")
+                if self.token:
+                    self._set_auth_header()
+                    self._log(f"Session restored for {self.name}")
             except:
-                error_msg = str(e)
-            await update.message.reply_text(f"❌ HTTP error: {error_msg}")
+                pass
+
+    def _clear_session(self):
+        """Clear session (mirrors logout)."""
+        self.token = self.user_id = self.name = self.mobile = None
+        self.session.headers.pop("Authorization", None)
+        self.session.headers.pop("authtoken", None)
+        if os.path.exists(self.session_file):
+            os.remove(self.session_file)
+
+    def _set_auth_header(self):
+        """Set auth headers for all subsequent requests."""
+        self.session.headers["Authorization"] = f"Bearer {self.token}"
+        self.session.headers["authtoken"]     = self.token
+
+    # ── RAW API CALLS ─────────────────────────────────────────────
+    def _post(self, endpoint: str, data: dict = None) -> dict:
+        url  = API_BASE + endpoint
+        data = data or {}
+        try:
+            r = self.session.post(url, json=data, timeout=20)
+            self._log(f"POST {endpoint} → {r.status_code}")
+            resp = r.json()
+            if resp.get("status") == 0:
+                raise BTSAPIError(f"{endpoint}: {resp.get('message','API error')}")
+            return resp
+        except BTSAPIError:
+            raise
         except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-        context.user_data["login_step"] = None
-    else:
-        await update.message.reply_text("Please start with /login first.")
+            raise BTSAPIError(f"Request failed [{endpoint}]: {e}")
 
-async def courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    api = user_sessions.get(user_id)
-    if not api:
-        # Try using cached data if available
-        if cached_data_loaded:
-            courses_list = cached_courses
-            if not courses_list:
-                await update.message.reply_text("No cached courses available.")
-                return
-            user_courses[user_id] = courses_list
-            msg = "📖 Available Courses (cached):\n\n"
-            for i, c in enumerate(courses_list, 1):
-                msg += f"{i}. {c['courseName']} (ID: {c['courseId']})\n"
-            msg += "\nUse /select to choose course(s) (e.g., 1,3,5 or 1-5)"
-            await update.message.reply_text(msg)
-            return
-        else:
-            await update.message.reply_text("❌ Not logged in. Use /login first.")
-        return
+    def _get(self, endpoint: str, params: dict = None) -> dict:
+        url = API_BASE + endpoint
+        try:
+            r = self.session.get(url, params=params, timeout=20)
+            self._log(f"GET {endpoint} → {r.status_code}")
+            resp = r.json()
+            if resp.get("status") == 0:
+                raise BTSAPIError(f"{endpoint}: {resp.get('message','API error')}")
+            return resp
+        except BTSAPIError:
+            raise
+        except Exception as e:
+            raise BTSAPIError(f"Request failed [{endpoint}]: {e}")
 
-    await update.message.reply_text("📚 Fetching courses...")
-    try:
-        data = api.all_courses()
-    except PermissionError:
-        if user_id in user_credentials:
-            await update.message.reply_text("🔄 Auto‑re‑logging in...")
-            mobile, password, android_id = user_credentials[user_id]
-            api = BridgeToSuccessAPI(mobile=mobile, password=password, android_id=android_id)
+    def _as_list(self, data) -> list:
+        if isinstance(data, list): return data
+        if isinstance(data, dict): return list(data.values())
+        return []
+
+    def _extract(self, resp: dict, *keys):
+        """Extract first matching key from nested response data."""
+        d = resp.get("data") or resp
+        if isinstance(d, dict):
+            for k in keys:
+                v = d.get(k)
+                if v: return v
+            # Check nested 'user' key
+            u = d.get("user", {})
+            if isinstance(u, dict):
+                for k in keys:
+                    v = u.get(k)
+                    if v: return v
+        return None
+
+    # ─────────────────────────────────────────────────────────────
+    # STEP 1 — SPLASH / STARTUP
+    # Mirrors: SplashActivity → check token → LoginActivity or Home
+    # ─────────────────────────────────────────────────────────────
+    def is_logged_in(self) -> bool:
+        """Check if session exists (mirrors SplashActivity token check)."""
+        return bool(self.token)
+
+    # ─────────────────────────────────────────────────────────────
+    # STEP 2 — LOGIN
+    # Mirrors: LoginActivity → callLoginAPI → MenuActivity
+    # ─────────────────────────────────────────────────────────────
+    def login(self, mobile: str, password: str) -> dict:
+        """
+        Login with mobile + password.
+        Mirrors LoginActivity.callLoginAPI()
+        """
+        self._log(f"Logging in as {mobile}...")
+
+        combos = [
+            {"mobile": mobile, "password": password},
+            {"phone" : mobile, "password": password},
+            {"mobile": mobile, "pass"    : password},
+        ]
+
+        last_error = None
+        for combo in combos:
             try:
-                result = api.login_api(mobile, password, android_id, "")
-                api._process_login_response(result)
-                if api.user_id and api.auth_token:
-                    user_sessions[user_id] = api
-                    data = api.all_courses()
-                else:
-                    await update.message.reply_text("❌ Auto‑re‑login failed. Please /login again.")
-                    return
-            except Exception as e:
-                await update.message.reply_text(f"❌ Auto‑re‑login error: {str(e)}")
-                return
-        else:
-            await update.message.reply_text("❌ Session expired. Please /login again.")
-            return
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to fetch courses: {str(e)}")
-        return
-    courses_list = extract_courses(data)
-    if not courses_list:
-        await update.message.reply_text("❌ No courses found.")
-        return
-    user_courses[user_id] = courses_list
-    msg = "📖 Available Courses:\n\n"
-    for i, c in enumerate(courses_list, 1):
-        msg += f"{i}. {c['courseName']} (ID: {c['courseId']})\n"
-    msg += "\nUse /select to choose course(s) (e.g., 1,3,5 or 1-5)"
-    await update.message.reply_text(msg)
+                payload = {**combo, "type": "login", **DEVICE_INFO}
+                resp    = self._post("login", payload)
 
-async def select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    api = user_sessions.get(user_id)
-    if not api:
-        await update.message.reply_text("❌ Not logged in. Use /login first.")
-        return
-    courses_list = user_courses.get(user_id)
-    if not courses_list:
-        await update.message.reply_text("❌ No course list. Use /courses first.")
-        return
-    await update.message.reply_text("📝 Enter the numbers of the courses you want (e.g., 1,3,5 or 1-5):")
-    context.user_data["select_step"] = "waiting_selection"
+                self.token   = self._extract(resp, "token","authtoken","api_token","access_token") or ""
+                self.user_id = str(self._extract(resp, "id","user_id","userId") or "")
+                self.name    = self._extract(resp, "name","full_name","student_name") or mobile
+                self.mobile  = mobile
 
-async def handle_select_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if context.user_data.get("select_step") != "waiting_selection":
-        return
-    api = user_sessions.get(user_id)
-    if not api:
-        await update.message.reply_text("❌ Not logged in. Use /login first.")
-        context.user_data["select_step"] = None
-        return
-    courses_list = user_courses.get(user_id)
-    if not courses_list:
-        await update.message.reply_text("❌ No courses. Use /courses first.")
-        context.user_data["select_step"] = None
-        return
-    selection_text = update.message.text.strip()
-    indices = parse_selection(selection_text, len(courses_list))
-    if indices is None:
-        await update.message.reply_text("❌ Invalid selection. Please use numbers like 1,3,5 or 1-5.")
-        return
-    selected = [courses_list[i] for i in indices]
-    await update.message.reply_text(f"✅ Selected {len(selected)} course(s). Fetching media...")
-
-    all_media = []
-    for course in selected:
-        cat_id = course["categoryId"]
-        try:
-            videos = api.all_course_video(cat_id)
-            all_media.extend(extract_media_entries(videos))
-        except PermissionError:
-            if user_id in user_credentials:
-                mobile, password, android_id = user_credentials[user_id]
-                api = BridgeToSuccessAPI(mobile=mobile, password=password, android_id=android_id)
-                try:
-                    result = api.login_api(mobile, password, android_id, "")
-                    api._process_login_response(result)
-                    if api.user_id and api.auth_token:
-                        user_sessions[user_id] = api
-                        videos = api.all_course_video(cat_id)
-                        all_media.extend(extract_media_entries(videos))
-                    else:
-                        await update.message.reply_text("❌ Auto‑re‑login failed.")
-                        context.user_data["select_step"] = None
-                        return
-                except Exception as e:
-                    await update.message.reply_text(f"❌ Auto‑re‑login error: {str(e)}")
-                    context.user_data["select_step"] = None
-                    return
-            else:
-                await update.message.reply_text("❌ Session expired. Please /login again.")
-                context.user_data["select_step"] = None
-                return
-        except Exception as e:
-            await update.message.reply_text(f"⚠️ Video error: {str(e)}")
-        try:
-            pdfs = api.all_course_pdf(cat_id)
-            all_media.extend(extract_media_entries(pdfs))
-        except Exception as e:
-            await update.message.reply_text(f"⚠️ PDF error: {str(e)}")
-        time.sleep(0.5)
-
-    # Free content
-    try:
-        free_v = api.free_course_video()
-        all_media.extend(extract_media_entries(free_v))
-    except:
-        pass
-    try:
-        free_p = api.free_course_pdf()
-        all_media.extend(extract_media_entries(free_p))
-    except:
-        pass
-
-    seen = set()
-    unique = []
-    for url, title in all_media:
-        if url not in seen:
-            seen.add(url)
-            unique.append((url, title))
-
-    if not unique:
-        await update.message.reply_text("No media found for the selected courses.")
-        context.user_data["select_step"] = None
-        return
-
-    content = generate_media_text(unique)
-    filename = f"course_media_{user_id}.txt"
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    await update.message.reply_document(
-        document=open(filename, "rb"),
-        filename="selected_courses_media.txt",
-        caption=f"✅ Media URLs for {len(unique)} items."
-    )
-    os.remove(filename)
-    context.user_data["select_step"] = None
-
-# --- Free content commands (fixed) ---
-async def free(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    api = user_sessions.get(user_id)
-    if not api:
-        if cached_data_loaded and (cached_free_videos or cached_free_pdfs):
-            msg = "📂 Free Content (cached):\n\n"
-            if cached_free_videos:
-                msg += "🎬 Videos:\n"
-                for url, title in cached_free_videos[:10]:
-                    msg += f"  - {title} -> {url}\n"
-                if len(cached_free_videos) > 10:
-                    msg += f"  ... and {len(cached_free_videos)-10} more.\n"
-            if cached_free_pdfs:
-                msg += "📄 PDFs:\n"
-                for url, title in cached_free_pdfs[:10]:
-                    msg += f"  - {title} -> {url}\n"
-                if len(cached_free_pdfs) > 10:
-                    msg += f"  ... and {len(cached_free_pdfs)-10} more.\n"
-            await update.message.reply_text(msg)
-        else:
-            await update.message.reply_text("❌ Not logged in and no cached free content. Use /login first.")
-        return
-
-    await update.message.reply_text("📂 Fetching free content...")
-    try:
-        # Attempt to fetch categories, but if they fail, we fall back to direct fetch
-        video_cats_data = None
-        pdf_cats_data = None
-        try:
-            video_cats_data = api.get_free_content_category("video")
-        except Exception:
-            pass
-        try:
-            pdf_cats_data = api.get_free_content_category("pdf")
-        except Exception:
-            pass
-
-        categories = []
-        if video_cats_data:
-            video_cats = extract_categories(video_cats_data)
-            for cat in video_cats:
-                cat["type"] = "video"
-            categories.extend(video_cats)
-        if pdf_cats_data:
-            pdf_cats = extract_categories(pdf_cats_data)
-            for cat in pdf_cats:
-                cat["type"] = "pdf"
-            categories.extend(pdf_cats)
-
-        # If we have categories, present them; otherwise fetch all free content directly
-        if categories:
-            user_free_categories[user_id] = categories
-            msg = "📖 Free Content Categories:\n\n"
-            for i, cat in enumerate(categories, 1):
-                msg += f"{i}. {cat['categoryName']} ({cat['type']})\n"
-            msg += "\nUse /free_select <number> to export media from a category."
-            await update.message.reply_text(msg)
-        else:
-            # Fallback: fetch all free content directly
-            await update.message.reply_text("No categories found. Fetching all free content directly...")
-            videos = api.free_course_video()
-            pdfs = api.free_course_pdf()
-            all_media = []
-            all_media.extend(extract_media_entries(videos))
-            all_media.extend(extract_media_entries(pdfs))
-            if not all_media:
-                await update.message.reply_text("No free content found.")
-                return
-            unique = list(dict.fromkeys(all_media))
-            content = generate_media_text(unique)
-            filename = f"free_media_{user_id}.txt"
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(content)
-            await update.message.reply_document(
-                document=open(filename, "rb"),
-                filename="free_content.txt",
-                caption=f"✅ Free content: {len(unique)} items."
-            )
-            os.remove(filename)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-async def free_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    api = user_sessions.get(user_id)
-    if not api:
-        await update.message.reply_text("❌ Not logged in.")
-        return
-    categories = user_free_categories.get(user_id)
-    if not categories:
-        await update.message.reply_text("❌ No categories found. Run /free first.")
-        return
-    args = context.args
-    if not args:
-        await update.message.reply_text("❌ Please provide a category number: /free_select 1")
-        return
-    try:
-        idx = int(args[0]) - 1
-        if idx < 0 or idx >= len(categories):
-            await update.message.reply_text("❌ Invalid number.")
-            return
-    except ValueError:
-        await update.message.reply_text("❌ Please enter a number.")
-        return
-    cat = categories[idx]
-    cat_id = cat["categoryId"]
-    cat_type = cat["type"]
-    await update.message.reply_text(f"📥 Fetching {cat_type} content for '{cat['categoryName']}'...")
-    try:
-        content_data = api.get_free_content(cat_type, cat_id, page=1, page_size=100)
-        media_entries = extract_media_entries(content_data)
-        if not media_entries:
-            await update.message.reply_text("No media found in this category.")
-            return
-        seen = set()
-        unique = []
-        for url, title in media_entries:
-            if url not in seen:
-                seen.add(url)
-                unique.append((url, title))
-        content_text = generate_media_text(unique)
-        filename = f"free_category_{user_id}.txt"
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(content_text)
-        await update.message.reply_document(
-            document=open(filename, "rb"),
-            filename=f"{cat['categoryName']}_{cat_type}.txt",
-            caption=f"✅ {len(unique)} media items in {cat['categoryName']}"
-        )
-        os.remove(filename)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-# --- All courses dump ---
-async def allcourses(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    api = user_sessions.get(user_id)
-    if not api and cached_data_loaded:
-        # Use cached data
-        courses = cached_courses
-        lines = []
-        lines.append("=== ALL COURSES (cached) ===")
-        for course in courses:
-            lines.append(f"\n📚 {course['courseName']} (ID: {course['courseId']})")
-            for cat in course.get("categories", []):
-                lines.append(f"\n  🗂️ {cat['categoryName']} (ID: {cat['categoryId']})")
-                videos = cat.get("videos", [])
-                if videos:
-                    lines.append(f"    🎬 Videos ({len(videos)}):")
-                    for vurl, vtitle in videos:
-                        lines.append(f"      - {vtitle} -> {vurl}")
-                else:
-                    lines.append("    Videos: None")
-                pdfs = cat.get("pdfs", [])
-                if pdfs:
-                    lines.append(f"    📄 PDFs ({len(pdfs)}):")
-                    for purl, ptitle in pdfs:
-                        lines.append(f"      - {ptitle} -> {purl}")
-                else:
-                    lines.append("    PDFs: None")
-        if cached_free_videos:
-            lines.append("\n\n=== FREE VIDEOS ===")
-            for vurl, vtitle in cached_free_videos:
-                lines.append(f"- {vtitle} -> {vurl}")
-        if cached_free_pdfs:
-            lines.append("\n\n=== FREE PDFs ===")
-            for purl, ptitle in cached_free_pdfs:
-                lines.append(f"- {ptitle} -> {purl}")
-        content = "\n".join(lines)
-        filename = f"all_courses_cache_{user_id}.txt"
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(content)
-        await update.message.reply_document(
-            document=open(filename, "rb"),
-            filename="all_courses_cached.txt",
-            caption="✅ Full course dump (cached)."
-        )
-        os.remove(filename)
-        return
-    if not api:
-        await update.message.reply_text("❌ Not logged in and no cached data. Use /login first.")
-        return
-    await update.message.reply_text("📚 Fetching all courses and their contents... This may take a while.")
-    try:
-        courses_data = api.all_courses()
-        courses_list = extract_courses(courses_data)
-        if not courses_list:
-            await update.message.reply_text("No courses found.")
-            return
-        total = len(courses_list)
-        output_lines = [f"Total Courses: {total}\n"]
-        for idx, course in enumerate(courses_list, 1):
-            course_id = course['courseId']
-            course_name = course['courseName']
-            output_lines.append(f"\n{idx}. {course_name} (ID: {course_id})")
-            output_lines.append("-" * 40)
-            try:
-                categories_data = api.get_all_category(course_id)
-                categories = extract_categories(categories_data)
-                if not categories:
-                    output_lines.append("  No categories found.")
-                    continue
-            except Exception as e:
-                output_lines.append(f"  Error fetching categories: {str(e)}")
+                self._set_auth_header()
+                self._save_session()
+                self._log(f"✅ Logged in as {self.name} (user_id={self.user_id})")
+                return {
+                    "success" : True,
+                    "name"    : self.name,
+                    "user_id" : self.user_id,
+                    "token"   : self.token,
+                }
+            except BTSAPIError as e:
+                last_error = e
                 continue
-            for cat in categories:
-                cat_id = cat['categoryId']
-                cat_name = cat['categoryName']
-                output_lines.append(f"\n  Category: {cat_name} (ID: {cat_id})")
+
+        raise BTSAuthError(f"Login failed: {last_error}")
+
+    # ─────────────────────────────────────────────────────────────
+    # STEP 2B — LOGOUT
+    # Mirrors: ProfileActivity → logout button
+    # ─────────────────────────────────────────────────────────────
+    def logout(self):
+        """Logout and clear session. Mirrors logout button in app."""
+        try:
+            self._post("logout", {"user_id": self.user_id})
+        except:
+            pass
+        self._clear_session()
+        self._log("Logged out.")
+
+    # ─────────────────────────────────────────────────────────────
+    # STEP 3 — HOME / DASHBOARD
+    # Mirrors: MenuActivity → DashboardActivity
+    # ─────────────────────────────────────────────────────────────
+    def get_home_data(self) -> dict:
+        """
+        Get home screen data.
+        Mirrors DashboardActivity loading banners, top courses, notifications.
+        """
+        resp = self._get("get-home-data")
+        data = resp.get("data", {})
+        return {
+            "banners"     : self._as_list(data.get("slider") or data.get("banner", [])),
+            "top_courses" : self._as_list(data.get("top_course") or data.get("top_courses", [])),
+            "notices"     : self._as_list(data.get("notice") or data.get("notices", [])),
+            "raw"         : data,
+        }
+
+    def get_profile(self) -> dict:
+        """Get student profile. Mirrors ProfileActivity."""
+        resp = self._get("get-profile")
+        return resp.get("data", {})
+
+    def get_notifications(self) -> list:
+        """Get notifications. Mirrors NotificationListActivity."""
+        resp = self._get("get-notifications")
+        return self._as_list(resp.get("data", []))
+
+    # ─────────────────────────────────────────────────────────────
+    # STEP 4 — COURSES
+    # Mirrors: AllCoursesActivity / MyCoursesActivity
+    # ─────────────────────────────────────────────────────────────
+    def get_all_courses(self) -> list:
+        """Get all available courses. Mirrors AllCoursesActivity."""
+        resp = self._get("get-all-courses")
+        return self._as_list(resp.get("data", []))
+
+    def get_my_courses(self) -> list:
+        """Get enrolled courses. Mirrors MyCoursesActivity."""
+        resp = self._get("get-my-courses")
+        return self._as_list(resp.get("data", []))
+
+    def get_top_courses(self) -> list:
+        """Get top/featured courses. Mirrors TopCoursesActivity."""
+        resp = self._get("get-top-courses")
+        return self._as_list(resp.get("data", []))
+
+    def get_categories(self) -> list:
+        """Get course categories. Mirrors CategoryActivity."""
+        resp = self._get("get-categories")
+        return self._as_list(resp.get("data", []))
+
+    def get_category_courses(self, category_id) -> list:
+        """Get courses by category."""
+        resp = self._post("get-category-courses", {"category_id": category_id})
+        return self._as_list(resp.get("data", []))
+
+    def get_course_detail(self, course_id) -> dict:
+        """Get full course details. Mirrors CourseDetailActivity."""
+        resp = self._post("get-course-detail", {"course_id": course_id})
+        return resp.get("data", {})
+
+    # ─────────────────────────────────────────────────────────────
+    # STEP 5 — ENROLL
+    # Mirrors: ShoppingCartActivity → RazorPayActivity
+    # ─────────────────────────────────────────────────────────────
+    def enroll_free(self, course_id) -> dict:
+        """Enroll in a free course. Mirrors enroll-free-course flow."""
+        resp = self._post("enroll-free-course", {"course_id": course_id})
+        self._log(f"Enrolled in course {course_id}")
+        return resp.get("data", {})
+
+    def get_cart(self) -> list:
+        """Get shopping cart. Mirrors ShoppingCartActivity."""
+        resp = self._get("get-cart")
+        return self._as_list(resp.get("data", []))
+
+    # ─────────────────────────────────────────────────────────────
+    # STEP 6 — CONTENT TREE
+    # Mirrors: VideoPdfTabViewActivity content hierarchy
+    # ─────────────────────────────────────────────────────────────
+    def get_batch_list(self, course_id) -> list:
+        """Get batches for a course."""
+        resp = self._post("get-batch-list", {"course_id": course_id})
+        return self._as_list(resp.get("data", []))
+
+    def get_subject_list(self, course_id, batch_id=None) -> list:
+        """Get subjects. Mirrors subject list screen."""
+        payload = {"course_id": course_id}
+        if batch_id: payload["batch_id"] = batch_id
+        resp = self._post("get-subject-list", payload)
+        return self._as_list(resp.get("data", []))
+
+    def get_chapter_list(self, course_id, subject_id, batch_id=None) -> list:
+        """Get chapters for a subject."""
+        payload = {"course_id": course_id, "subject_id": subject_id}
+        if batch_id: payload["batch_id"] = batch_id
+        resp = self._post("get-chapter-list", payload)
+        return self._as_list(resp.get("data", []))
+
+    def get_topic_list(self, course_id, subject_id, chapter_id) -> list:
+        """Get topics for a chapter."""
+        resp = self._post("get-topic-list", {
+            "course_id" : course_id,
+            "subject_id": subject_id,
+            "chapter_id": chapter_id,
+        })
+        return self._as_list(resp.get("data", []))
+
+    # ─────────────────────────────────────────────────────────────
+    # STEP 7A — VIDEOS
+    # Mirrors: PlayVideoActivity → ExoPlayer / WebView
+    # ─────────────────────────────────────────────────────────────
+    def get_video_list(self, course_id, subject_id, chapter_id,
+                       batch_id=None) -> list:
+        """
+        Get video list for a chapter.
+        Mirrors get-video-list API call in VideoPdfTabViewActivity.
+        """
+        payload = {
+            "course_id" : course_id,
+            "subject_id": subject_id,
+            "chapter_id": chapter_id,
+        }
+        if batch_id: payload["batch_id"] = batch_id
+        resp = self._post("get-video-list", payload)
+        videos = self._as_list(resp.get("data", []))
+
+        # Resolve play URLs exactly like the app does
+        for v in videos:
+            v["play_url"] = self._resolve_video_url(v)
+
+        return videos
+
+    def _resolve_video_url(self, v: dict) -> str:
+        """
+        Resolve the actual playable URL from video data.
+        Mirrors the switch-case in PlayVideoActivity / ExoPlayerMedia3Activity.
+        
+        Video types found in APK:
+          lct      → LCT custom player (HLS/MP4)
+          youtube  → YouTube embed / ytdl proxy
+          vimeo    → Vimeo player
+          live     → LCT live stream player
+        """
+        vtype = str(v.get("video_type") or v.get("type") or "").lower()
+
+        # Get raw URL or ID
+        raw = None
+        for k in ["video_url","url","file_url","hls_url","stream_url","link","video_link"]:
+            val = v.get(k, "")
+            if val and isinstance(val, str) and len(val) > 2:
+                raw = val
+                break
+
+        if not raw:
+            raw = str(v.get("id") or v.get("video_id") or "")
+
+        if not raw:
+            return "URL_NOT_FOUND"
+
+        # Resolve by type (mirrors app's video type switch)
+        if "live" in vtype:
+            return LIVE_PLAYER_URL + raw if not raw.startswith("http") else raw
+
+        if "youtube" in vtype or "yt" in vtype:
+            if "youtube.com" in raw or "youtu.be" in raw:
+                return raw
+            return f"https://www.youtube.com/watch?v={raw}"
+
+        if "vimeo" in vtype:
+            if "vimeo.com" in raw:
+                return raw
+            return f"https://player.vimeo.com/video/{raw}"
+
+        # Default: LCT player (self-hosted)
+        if raw.startswith("http"):
+            return raw
+        return PLAYER_URL + raw
+
+    def get_video_detail(self, video_id) -> dict:
+        """Get single video detail."""
+        resp = self._post("get-video-detail", {"video_id": video_id})
+        data = resp.get("data", {})
+        if isinstance(data, dict):
+            data["play_url"] = self._resolve_video_url(data)
+        return data
+
+    def get_free_videos(self) -> list:
+        """Get free videos (no auth needed). Mirrors FreeVideoActivity."""
+        resp = self._get("get-free-video")
+        videos = self._as_list(resp.get("data", []))
+        for v in videos:
+            v["play_url"] = self._resolve_video_url(v)
+        return videos
+
+    def get_live_classes(self) -> list:
+        """Get live classes. Mirrors LiveClassActivity."""
+        resp = self._get("get-live-class")
+        classes = self._as_list(resp.get("data", []))
+        for c in classes:
+            c["play_url"] = LIVE_PLAYER_URL + str(c.get("id") or c.get("stream_id") or "")
+        return classes
+
+    # ─────────────────────────────────────────────────────────────
+    # STEP 7B — PDFs / NOTES
+    # Mirrors: PDF_View → barteksc/AndroidPdfViewer
+    # ─────────────────────────────────────────────────────────────
+    def get_pdf_list(self, course_id, subject_id, chapter_id,
+                     batch_id=None) -> list:
+        """
+        Get PDF list for a chapter.
+        Mirrors get-pdf-list API call.
+        """
+        payload = {
+            "course_id" : course_id,
+            "subject_id": subject_id,
+            "chapter_id": chapter_id,
+        }
+        if batch_id: payload["batch_id"] = batch_id
+        resp = self._post("get-pdf-list", payload)
+        pdfs = self._as_list(resp.get("data", []))
+
+        for p in pdfs:
+            p["pdf_full_url"] = self._resolve_pdf_url(p)
+
+        return pdfs
+
+    def _resolve_pdf_url(self, p: dict) -> str:
+        """
+        Resolve full PDF URL.
+        Mirrors PDF_View / ViewPdfWebViewActivity URL building.
+        """
+        for k in ["pdf_url","url","file_url","file","link","pdf_file","pdf_link"]:
+            val = p.get(k, "")
+            if val and isinstance(val, str) and len(val) > 2:
+                if val.startswith("http"):
+                    return val
+                return STORAGE["pdf"] + val
+        return "URL_NOT_FOUND"
+
+    def get_free_pdfs(self) -> list:
+        """Get free PDFs (no auth). Mirrors FreePdfActivity."""
+        resp = self._get("get-free-pdf")
+        pdfs = self._as_list(resp.get("data", []))
+        for p in pdfs:
+            p["pdf_full_url"] = self._resolve_pdf_url(p)
+        return pdfs
+
+    def download_pdf(self, pdf_url_or_filename: str,
+                     save_path: str = None,
+                     show_progress: bool = True) -> str:
+        """
+        Download a PDF file.
+        Mirrors how barteksc/AndroidPdfViewer downloads PDF before rendering.
+        
+        Args:
+            pdf_url_or_filename: Full URL or just filename
+            save_path: Where to save. Defaults to filename in current dir.
+            show_progress: Print download progress.
+        
+        Returns:
+            Path to downloaded file.
+        """
+        # Build full URL if only filename given
+        if not pdf_url_or_filename.startswith("http"):
+            url = STORAGE["pdf"] + pdf_url_or_filename
+        else:
+            url = pdf_url_or_filename
+
+        filename = url.split("/")[-1].split("?")[0] or "download.pdf"
+        save_path = save_path or filename
+
+        self._log(f"Downloading PDF: {url}")
+        try:
+            r = self.session.get(url, stream=True, timeout=30)
+            r.raise_for_status()
+
+            total = int(r.headers.get("content-length", 0))
+            downloaded = 0
+
+            with open(save_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if show_progress and total:
+                            pct = downloaded * 100 // total
+                            print(f"\r  Downloading... {pct}% ({downloaded//1024}KB)", end="")
+
+            if show_progress:
+                print(f"\r✅ Downloaded: {save_path} ({downloaded//1024} KB)    ")
+
+            return save_path
+        except Exception as e:
+            raise BTSError(f"PDF download failed: {e}")
+
+    # ─────────────────────────────────────────────────────────────
+    # STEP 8 — TESTS / QUIZZES
+    # Mirrors: TestSeriesActivity → WebView
+    # ─────────────────────────────────────────────────────────────
+    def get_test_series(self) -> list:
+        """Get test series list. Mirrors TestSeriesActivity."""
+        resp = self._get("get-test-series")
+        return self._as_list(resp.get("data", []))
+
+    def get_test_list(self, series_id) -> list:
+        """Get tests in a series. Mirrors TestSeriesListActivity."""
+        resp = self._post("get-test-list", {"series_id": series_id})
+        return self._as_list(resp.get("data", []))
+
+    def get_test_detail(self, test_id) -> dict:
+        """Get test detail. Mirrors TestDetailListActivity."""
+        resp = self._post("get-test-detail", {"test_id": test_id})
+        return resp.get("data", {})
+
+    def get_test_url(self, test_id) -> str:
+        """
+        Get the WebView URL to attempt a test.
+        Mirrors the URL opened in WebView by TestActivity.
+        """
+        return TEST_URL % (test_id, self.user_id)
+
+    def get_test_answers_url(self, test_id) -> str:
+        """
+        Get the WebView URL to view test answers.
+        Mirrors ViewTestAnswersActivity WebView URL.
+        """
+        return TEST_ANSWER_URL % (test_id, self.user_id)
+
+    # ─────────────────────────────────────────────────────────────
+    # EBOOKS
+    # Mirrors: EBookListActivity / EbookActivity
+    # ─────────────────────────────────────────────────────────────
+    def get_ebook_list(self) -> list:
+        """Get ebooks. Mirrors EBookListActivity."""
+        resp = self._get("get-ebook-list")
+        return self._as_list(resp.get("data", []))
+
+    def get_ebook_series(self) -> list:
+        """Get ebook series. Mirrors EBookSeriesActivity."""
+        resp = self._get("get-ebook-series")
+        return self._as_list(resp.get("data", []))
+
+    # ─────────────────────────────────────────────────────────────
+    # DOUBTS & TICKETS
+    # Mirrors: CourseDoubtListActivity / TicketListActivity
+    # ─────────────────────────────────────────────────────────────
+    def get_doubts(self, course_id) -> list:
+        """Get doubts for a course. Mirrors CourseDoubtListActivity."""
+        resp = self._post("get-doubt-list", {"course_id": course_id})
+        return self._as_list(resp.get("data", []))
+
+    def add_doubt(self, course_id, question: str) -> dict:
+        """Post a doubt. Mirrors CourseDoubtAddActivity."""
+        resp = self._post("add-doubt", {
+            "course_id": course_id,
+            "question" : question,
+        })
+        return resp.get("data", {})
+
+    def get_tickets(self) -> list:
+        """Get support tickets. Mirrors TicketListActivity."""
+        resp = self._get("get-ticket-list")
+        return self._as_list(resp.get("data", []))
+
+    # ─────────────────────────────────────────────────────────────
+    # TIMETABLE / EVENTS
+    # ─────────────────────────────────────────────────────────────
+    def get_timetable(self, course_id) -> list:
+        """Get timetable for a course."""
+        resp = self._post("get-timetable", {"course_id": course_id})
+        return self._as_list(resp.get("data", []))
+
+    def get_events(self) -> list:
+        """Get events. Mirrors PlayEventVideoActivity."""
+        resp = self._get("get-events")
+        return self._as_list(resp.get("data", []))
+
+    # ─────────────────────────────────────────────────────────────
+    # FULL COURSE SCRAPER
+    # Walks the entire content tree of a course
+    # ─────────────────────────────────────────────────────────────
+    def scrape_course(self, course_id, course_name: str = "") -> dict:
+        """
+        Scrape ALL content from a course.
+        Walks: subjects → chapters → videos + PDFs
+        
+        Returns dict with all videos and PDFs found.
+        """
+        self._log(f"Scraping course: {course_name or course_id}")
+        results = {"videos": [], "pdfs": [], "course": course_name}
+
+        subjects = self.get_subject_list(course_id)
+        if not subjects:
+            subjects = [{"id": None, "name": "General"}]
+
+        for s in subjects:
+            sid   = s.get("id") or s.get("subject_id")
+            sname = s.get("name") or s.get("subject_name") or "General"
+            self._log(f"  Subject: {sname}")
+
+            chapters = self.get_chapter_list(course_id, sid)
+            if not chapters:
+                chapters = [{"id": None, "name": "General"}]
+
+            for c in chapters:
+                cid   = c.get("id") or c.get("chapter_id")
+                cname = c.get("name") or c.get("chapter_name") or "General"
+
+                # Videos
                 try:
-                    videos_data = api.all_course_video(cat_id)
-                    video_entries = extract_media_entries(videos_data)
-                    if video_entries:
-                        output_lines.append(f"    Videos ({len(video_entries)}):")
-                        for vurl, vtitle in video_entries:
-                            output_lines.append(f"      - {vtitle} -> {vurl}")
-                    else:
-                        output_lines.append("    Videos: None")
-                except Exception as e:
-                    output_lines.append(f"    Videos: Error - {str(e)}")
+                    videos = self.get_video_list(course_id, sid, cid)
+                    for v in videos:
+                        results["videos"].append({
+                            "title"      : v.get("title") or v.get("name") or "Untitled",
+                            "play_url"   : v.get("play_url", ""),
+                            "video_type" : v.get("video_type") or "lct",
+                            "course"     : course_name,
+                            "subject"    : sname,
+                            "chapter"    : cname,
+                            "duration"   : v.get("duration") or "",
+                        })
+                    self._log(f"    Chapter: {cname} → {len(videos)} videos")
+                except:
+                    pass
+
+                # PDFs
                 try:
-                    pdfs_data = api.all_course_pdf(cat_id)
-                    pdf_entries = extract_media_entries(pdfs_data)
-                    if pdf_entries:
-                        output_lines.append(f"    PDFs ({len(pdf_entries)}):")
-                        for purl, ptitle in pdf_entries:
-                            output_lines.append(f"      - {ptitle} -> {purl}")
-                    else:
-                        output_lines.append("    PDFs: None")
-                except Exception as e:
-                    output_lines.append(f"    PDFs: Error - {str(e)}")
-                time.sleep(0.3)
-            if idx % 5 == 0:
-                await update.message.reply_text(f"⏳ Processed {idx}/{total} courses...")
-        content = "\n".join(output_lines)
-        filename = f"all_courses_detail_{user_id}.txt"
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(content)
-        await update.message.reply_document(
-            document=open(filename, "rb"),
-            filename="all_courses_details.txt",
-            caption="✅ Full dump of all courses with their contents."
-        )
-        os.remove(filename)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+                    pdfs = self.get_pdf_list(course_id, sid, cid)
+                    for p in pdfs:
+                        results["pdfs"].append({
+                            "title"    : p.get("title") or p.get("name") or "Untitled",
+                            "pdf_url"  : p.get("pdf_full_url", ""),
+                            "course"   : course_name,
+                            "subject"  : sname,
+                            "chapter"  : cname,
+                        })
+                    self._log(f"    Chapter: {cname} → {len(pdfs)} PDFs")
+                except:
+                    pass
 
-# --- Without login (cached) ---
-async def withoutlogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not cached_data_loaded:
-        await update.message.reply_text("❌ No cached data available. Master credentials may be missing or cache not loaded.")
-        return
-    user_id = update.effective_user.id
-    lines = []
-    lines.append("=== ALL COURSES (cached) ===")
-    for course in cached_courses:
-        lines.append(f"\n📚 {course['courseName']} (ID: {course['courseId']})")
-        for cat in course.get("categories", []):
-            lines.append(f"\n  🗂️ {cat['categoryName']} (ID: {cat['categoryId']})")
-            videos = cat.get("videos", [])
-            if videos:
-                lines.append(f"    🎬 Videos ({len(videos)}):")
-                for vurl, vtitle in videos:
-                    lines.append(f"      - {vtitle} -> {vurl}")
-            else:
-                lines.append("    Videos: None")
-            pdfs = cat.get("pdfs", [])
-            if pdfs:
-                lines.append(f"    📄 PDFs ({len(pdfs)}):")
-                for purl, ptitle in pdfs:
-                    lines.append(f"      - {ptitle} -> {purl}")
-            else:
-                lines.append("    PDFs: None")
-    if cached_free_videos:
-        lines.append("\n\n=== FREE VIDEOS ===")
-        for vurl, vtitle in cached_free_videos:
-            lines.append(f"- {vtitle} -> {vurl}")
-    if cached_free_pdfs:
-        lines.append("\n\n=== FREE PDFs ===")
-        for purl, ptitle in cached_free_pdfs:
-            lines.append(f"- {ptitle} -> {purl}")
-    lines.append(f"\n\nLast updated: {time.ctime()}")
-    content = "\n".join(lines)
-    filename = f"without_login_{user_id}.txt"
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(content)
-    await update.message.reply_document(
-        document=open(filename, "rb"),
-        filename="without_login_data.txt",
-        caption="✅ All cached data (no login required)."
-    )
-    os.remove(filename)
+                time.sleep(0.2)   # be polite
 
-# --- Profile & Notifications ---
-async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    api = user_sessions.get(user_id)
-    if not api:
-        await update.message.reply_text("❌ Not logged in. Use /login first.")
-        return
-    try:
-        data = api.get_profile()
-        await update.message.reply_text(f"Profile info:\n```\n{json.dumps(data, indent=2)}\n```", parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+        self._log(f"✅ Done: {len(results['videos'])} videos, {len(results['pdfs'])} PDFs")
+        return results
 
-async def notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    api = user_sessions.get(user_id)
-    if not api:
-        await update.message.reply_text("❌ Not logged in. Use /login first.")
-        return
-    try:
-        data = api.get_notifications()
-        await update.message.reply_text(f"Notifications:\n```\n{json.dumps(data, indent=2)}\n```", parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+    def scrape_all_courses(self) -> dict:
+        """
+        Scrape ALL enrolled courses.
+        Full content dump — mirrors doing everything in the app manually.
+        """
+        courses = self.get_my_courses()
+        if not courses:
+            self._log("No enrolled courses. Trying all courses...")
+            courses = self.get_all_courses()
 
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❓ Unknown command. Use /start to see available commands.")
+        all_results = {"courses": [], "total_videos": 0, "total_pdfs": 0}
 
-# -------------------------------------------------------------------
-# Main
-# -------------------------------------------------------------------
+        for c in courses:
+            cid   = c.get("id") or c.get("course_id")
+            cname = c.get("name") or c.get("course_name") or f"Course-{cid}"
+            self._log(f"\n📚 Course: {cname}")
+
+            result = self.scrape_course(cid, cname)
+            all_results["courses"].append(result)
+            all_results["total_videos"] += len(result["videos"])
+            all_results["total_pdfs"]   += len(result["pdfs"])
+
+        self._log(f"\n📦 Total: {all_results['total_videos']} videos, {all_results['total_pdfs']} PDFs")
+        return all_results
+
+    def export_links(self, results: dict, output_file: str = "all_links.json"):
+        """Export all scraped links to JSON file."""
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        self._log(f"✅ Exported to {output_file}")
+        return output_file
+
+    def download_all_pdfs(self, results: dict, folder: str = "pdfs"):
+        """Download all PDFs from scrape results."""
+        Path(folder).mkdir(exist_ok=True)
+        pdfs = []
+        for course in results.get("courses", []):
+            pdfs.extend(course.get("pdfs", []))
+
+        self._log(f"Downloading {len(pdfs)} PDFs to ./{folder}/")
+        for i, p in enumerate(pdfs, 1):
+            url  = p.get("pdf_url", "")
+            name = url.split("/")[-1] or f"pdf_{i}.pdf"
+            # Sanitize filename
+            name = "".join(c for c in name if c.isalnum() or c in "._- ").strip()
+            path = os.path.join(folder, name)
+            try:
+                self.download_pdf(url, path, show_progress=False)
+                self._log(f"  [{i}/{len(pdfs)}] ✅ {name}")
+            except Exception as e:
+                self._log(f"  [{i}/{len(pdfs)}] ❌ {name}: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# CLI — Run directly as script
+# ─────────────────────────────────────────────────────────────────
+
 def main():
-    try:
-        # Load master cache on startup if credentials exist
-        if MASTER_MOBILE and MASTER_PASSWORD:
-            load_master_data()
+    import sys
 
-        app = Application.builder().token(BOT_TOKEN).build()
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("login", login))
-        app.add_handler(CommandHandler("logout", logout))
-        app.add_handler(CommandHandler("courses", courses))
-        app.add_handler(CommandHandler("select", select))
-        app.add_handler(CommandHandler("free", free))
-        app.add_handler(CommandHandler("free_select", free_select))
-        app.add_handler(CommandHandler("allcourses", allcourses))
-        app.add_handler(CommandHandler("withoutlogin", withoutlogin))
-        app.add_handler(CommandHandler("profile", profile))
-        app.add_handler(CommandHandler("notifications", notifications))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_input))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_input))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
-        print("🤖 Bot is running...")
-        app.run_polling()
-    except Exception as e:
-        print(f"❌ Bot failed to start: {e}")
-        raise
+    print("=" * 60)
+    print("  Bridge to Success — Python SDK")
+    print("=" * 60)
+
+    app = BridgeToSuccess()
+
+    # Check saved session
+    if app.is_logged_in():
+        print(f"\n✅ Session found: {app.name} ({app.mobile})")
+        print("   (Delete bts_session.json to login again)\n")
+    else:
+        print("\n🔑 Login Required")
+        mobile   = input("Mobile number : ").strip()
+        password = input("Password      : ").strip()
+        try:
+            app.login(mobile, password)
+        except BTSAuthError as e:
+            print(f"❌ {e}")
+            sys.exit(1)
+
+    while True:
+        print("\n" + "─" * 40)
+        print("1. Home Data")
+        print("2. My Courses")
+        print("3. All Courses")
+        print("4. Scrape ALL course content (videos + PDFs)")
+        print("5. Export links to JSON")
+        print("6. Download all PDFs")
+        print("7. Free Videos (no login)")
+        print("8. Free PDFs (no login)")
+        print("9. Notifications")
+        print("10. Test Series")
+        print("0. Logout & Exit")
+        print("─" * 40)
+
+        choice = input("Choice: ").strip()
+
+        if choice == "1":
+            data = app.get_home_data()
+            print(f"\n📢 Banners    : {len(data['banners'])}")
+            print(f"🏆 Top Courses: {len(data['top_courses'])}")
+            print(f"📌 Notices    : {len(data['notices'])}")
+
+        elif choice == "2":
+            courses = app.get_my_courses()
+            print(f"\n📚 My Courses ({len(courses)}):")
+            for i, c in enumerate(courses, 1):
+                print(f"  {i}. [{c.get('id')}] {c.get('name') or c.get('course_name')}")
+
+        elif choice == "3":
+            courses = app.get_all_courses()
+            print(f"\n📚 All Courses ({len(courses)}):")
+            for i, c in enumerate(courses, 1):
+                print(f"  {i}. [{c.get('id')}] {c.get('name') or c.get('course_name')}")
+
+        elif choice == "4":
+            print("\n⏳ Scraping all courses...")
+            results = app.scrape_all_courses()
+            print(f"\n✅ Found:")
+            print(f"   🎬 Videos : {results['total_videos']}")
+            print(f"   📄 PDFs   : {results['total_pdfs']}")
+            # Store for export/download
+            app._last_results = results
+
+        elif choice == "5":
+            if not hasattr(app, "_last_results"):
+                print("❌ Run option 4 first.")
+            else:
+                f = app.export_links(app._last_results)
+                print(f"✅ Saved to {f}")
+
+        elif choice == "6":
+            if not hasattr(app, "_last_results"):
+                print("❌ Run option 4 first.")
+            else:
+                app.download_all_pdfs(app._last_results)
+
+        elif choice == "7":
+            videos = app.get_free_videos()
+            print(f"\n🎬 Free Videos ({len(videos)}):")
+            for v in videos:
+                print(f"  • {v.get('title')} → {v.get('play_url')}")
+
+        elif choice == "8":
+            pdfs = app.get_free_pdfs()
+            print(f"\n📄 Free PDFs ({len(pdfs)}):")
+            for p in pdfs:
+                print(f"  • {p.get('title')} → {p.get('pdf_full_url')}")
+
+        elif choice == "9":
+            notifs = app.get_notifications()
+            print(f"\n🔔 Notifications ({len(notifs)}):")
+            for n in notifs[:10]:
+                print(f"  • {n.get('title') or n.get('message','')}")
+
+        elif choice == "10":
+            series = app.get_test_series()
+            print(f"\n🧪 Test Series ({len(series)}):")
+            for s in series:
+                sid = s.get("id")
+                print(f"  [{sid}] {s.get('title') or s.get('name')}")
+                print(f"        URL: {app.get_test_url(sid)}")
+
+        elif choice == "0":
+            app.logout()
+            print("👋 Goodbye!")
+            break
+
+        else:
+            print("Invalid choice.")
+
 
 if __name__ == "__main__":
     main()
