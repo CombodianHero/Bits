@@ -47,6 +47,13 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set")
 
 BASE_URL = "https://bridgetosuccess.learncentre.tech/public/study_api_v9/"
+PLAYER_URL = "https://lctplayer.learncentre.online/v/player.php?v="
+
+STORAGE = {
+    "video": "https://bridgetosuccess.learncentre.tech/public/storage/video/",
+    "pdf": "https://bridgetosuccess.learncentre.tech/public/storage/pdf/",
+    "timetable": "https://bridgetosuccess.learncentre.tech/public/storage/timetable/",
+}
 
 user_sessions = {}
 user_credentials = {}
@@ -183,9 +190,6 @@ class BridgeToSuccessAPI:
 
     def get_all_category(self, course_id):
         return self.call("getAllCategory", courseId=course_id)
-
-    def get_category_mixed(self, course_id, category_id):
-        return self.call("getCategoryMixed", courseId=course_id, categoryId=category_id, userId=self.user_id)
 
     def course_info(self, course_id):
         return self.call("courseInfo", courseId=course_id, userId=self.user_id)
@@ -412,7 +416,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/debug – dump raw API response\n"
         "/debug_categories <course_id> – inspect categories API response\n"
         "/session – check session status\n"
-        "/getcourse <id> – fetch all videos/PDFs for a specific course ID\n"
+        "/getcourse <id> – fetch all videos/PDFs (including demo content) for a specific course ID\n"
         "/help – this message"
     )
 
@@ -828,13 +832,9 @@ async def debug_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     course_id = args[0].strip()
     try:
-        # Try getAllCategory
-        result1 = api.get_all_category(course_id)
-        # Try getCategoryMixed with a dummy category (or maybe no category)
-        # We'll just send both responses
+        result = api.get_all_category(course_id)
         msg = f"🔍 **Debug Categories for course {course_id}**\n\n"
-        msg += "**getAllCategory response:**\n```json\n" + json.dumps(result1, indent=2) + "\n```\n"
-        # Optionally also try getCategoryMixed with categoryId = ""?
+        msg += "**getAllCategory response:**\n```json\n" + json.dumps(result, indent=2) + "\n```\n"
         await update.message.reply_text(msg, parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
@@ -852,46 +852,71 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     course_id = args[0].strip()
+    all_media = []
+
     try:
-        # First, try to get categories from getAllCategory
+        # 1. Fetch course info to get demo content
+        info = api.course_info(course_id)
+        if info and "courses" in info and len(info["courses"]) > 0:
+            course = info["courses"][0]
+            intro_video_id = course.get("introVideoId")
+            batch_pdf = course.get("batchInfoPdf")
+            timetable_img = course.get("timeTableImg")
+            # isPurchased = course.get("isPurchased", "0")
+
+            # Intro video (demo)
+            if intro_video_id and intro_video_id != "null" and intro_video_id.strip():
+                video_url = PLAYER_URL + intro_video_id
+                all_media.append((video_url, "Intro Video (Demo)"))
+
+            # Batch info PDF (demo)
+            if batch_pdf and batch_pdf.strip():
+                pdf_url = STORAGE["pdf"] + batch_pdf
+                all_media.append((pdf_url, "Batch Info PDF (Demo)"))
+
+            # Timetable image (demo)
+            if timetable_img and timetable_img.strip():
+                img_url = STORAGE["timetable"] + timetable_img
+                all_media.append((img_url, "Timetable Image (Demo)"))
+
+        # 2. Try to get categories (only if purchased or if categories are available)
         categories_data = api.get_all_category(course_id)
         categories = extract_categories(categories_data)
 
-        # If empty, try getCategoryMixed (with userId)
-        if not categories:
-            logger.info(f"getAllCategory returned empty for {course_id}, trying getCategoryMixed...")
-            # We need a categoryId to call getCategoryMixed, but we don't have one.
-            # We'll try with an empty string or "0" as a workaround.
-            # Some APIs might return all categories if categoryId is empty.
-            # But likely it will fail. We'll just return a helpful message.
-            # Instead, we can try to fetch categories from courseInfo? Already did.
-            # So we'll note that the course might be unpurchased.
-            await update.message.reply_text(
-                f"❌ No categories found for course {course_id}.\n\n"
-                "This usually means the course is not purchased or the server restricts access.\n"
-                "If you have purchased this course, please try again later or use the app to verify.\n"
-                "You can also use `/debug_categories {course_id}` to inspect the raw server response."
+        if categories:
+            for cat in categories:
+                cat_id = cat["categoryId"]
+                cat_name = cat["categoryName"]
+                try:
+                    videos_data = api.all_course_video(cat_id)
+                    videos = extract_media_entries(videos_data)
+                    all_media.extend(videos)
+                except:
+                    pass
+                try:
+                    pdfs_data = api.all_course_pdf(cat_id)
+                    pdfs = extract_media_entries(pdfs_data)
+                    all_media.extend(pdfs)
+                except:
+                    pass
+                time.sleep(0.3)
+
+        if not all_media:
+            # Check if course is purchased from info
+            is_purchased = "Unknown"
+            if info and "courses" in info and len(info["courses"]) > 0:
+                is_purchased = info["courses"][0].get("isPurchased", "Unknown")
+            msg = (
+                f"❌ No content found for course {course_id}.\n\n"
+                f"Purchase status: {is_purchased}\n"
+                "If the course is not purchased, only demo content (intro video, batch PDF) is available.\n"
+                "This course has no demo content visible.\n\n"
+                "Use `/debug_categories {course_id}` to inspect raw API responses."
             )
+            await update.message.reply_text(msg)
             return
 
-        all_media = []
-        for cat in categories:
-            cat_id = cat["categoryId"]
-            cat_name = cat["categoryName"]
-            try:
-                videos_data = api.all_course_video(cat_id)
-                videos = extract_media_entries(videos_data)
-                all_media.extend(videos)
-            except:
-                pass
-            try:
-                pdfs_data = api.all_course_pdf(cat_id)
-                pdfs = extract_media_entries(pdfs_data)
-                all_media.extend(pdfs)
-            except:
-                pass
-            time.sleep(0.3)
-
+        # Deduplicate
         seen = set()
         unique = []
         for url, title in all_media:
@@ -899,11 +924,7 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 seen.add(url)
                 unique.append((url, title))
 
-        if not unique:
-            await update.message.reply_text(f"No media found for course {course_id}.")
-            return
-
-        # Build text file
+        # Build file
         lines = [f"Course ID: {course_id}"]
         for i, (url, title) in enumerate(unique, 1):
             lines.append(f"Entry {i}")
@@ -918,7 +939,7 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=open(filename, "rb"),
             filename=f"course_{course_id}_media.txt",
-            caption=f"✅ {len(unique)} media items for course ID {course_id}."
+            caption=f"✅ {len(unique)} media items for course {course_id} (including demo content)."
         )
         os.remove(filename)
 
