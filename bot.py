@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -------------------------------------------------------------------
-# Health Check Server
+# Health Check Server (for Koyeb)
 # -------------------------------------------------------------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -51,11 +51,11 @@ if not BOT_TOKEN:
 
 BASE_URL = "https://bridgetosuccess.learncentre.tech/public/study_api_v9/"
 
-user_sessions = {}
-user_credentials = {}
-user_courses = {}
-user_all_courses = {}
-user_free_categories = {}
+user_sessions = {}          # user_id -> BridgeToSuccessAPI instance
+user_credentials = {}       # user_id -> (mobile, password, android_id)
+user_courses = {}           # user_id -> list of purchased courses
+user_all_courses = {}       # user_id -> list of all courses
+user_free_categories = {}   # user_id -> list of free categories
 
 # -------------------------------------------------------------------
 # Helper: stable device ID per user
@@ -216,7 +216,7 @@ class BridgeToSuccessAPI:
         return self.call("getFreeContent", userId=self.user_id, courseType=course_type,
                          categoryId=category_id, pageNumber=str(page), pageItemSize=str(page_size))
 
-    # --- Bulk fetch for a user ---
+    # --- Bulk fetch for all courses (merges eBook and non-eBook) ---
     def fetch_all_courses_with_details(self, fetch_my=False):
         if fetch_my:
             courses_data = self.my_courses()
@@ -285,13 +285,13 @@ class BridgeToSuccessAPI:
         return free_videos, free_pdfs
 
 # -------------------------------------------------------------------
-# Helper functions (FIXED extract_courses to handle "id")
+# Helper functions
 # -------------------------------------------------------------------
 def extract_courses(json_data):
     courses = []
     def _extract(obj):
         if isinstance(obj, dict):
-            # Look for either "courseId" or "id"
+            # Accept both "id" and "courseId"
             course_id = obj.get("courseId") or obj.get("id")
             if course_id and "courseName" in obj:
                 course = {
@@ -393,7 +393,7 @@ def parse_selection(text, max_idx):
     return sorted(set(indices))
 
 # -------------------------------------------------------------------
-# Telegram Bot Handlers (unchanged, included for completeness)
+# Telegram Bot Handlers
 # -------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -407,42 +407,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/free_select <number> – export media from a free category\n"
         "/profile – your profile info\n"
         "/notifications – your notifications\n"
-        "/debug – dump raw API response (for troubleshooting)\n"
-        "/session – check your current session status\n"
+        "/debug – dump raw API response\n"
+        "/session – check session status\n"
+        "/getcourse <id> – fetch all videos/PDFs for a specific course ID\n"
         "/help – this message"
     )
 
-async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    api = user_sessions.get(user_id)
-    if not api:
-        await update.message.reply_text("❌ Not logged in.")
-        return
-    try:
-        normal = api.all_courses(is_ebook=False)
-        ebook = api.all_courses(is_ebook=True)
-        data = {"normal": normal, "ebook": ebook}
-        filename = f"debug_{user_id}.json"
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        await update.message.reply_document(
-            document=open(filename, "rb"),
-            filename="debug_courses.json",
-            caption="Raw API responses for allCourses (isEBook=0 and isEBook=1)."
-        )
-        os.remove(filename)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    api = user_sessions.get(user_id)
-    if api and api.auth_token:
-        await update.message.reply_text(
-            f"✅ Session active.\nUser ID: {api.user_id}\nToken: {'Present' if api.auth_token else 'Missing'}\nMobile: {api.mobile}"
-        )
-    else:
-        await update.message.reply_text("❌ No active session. Use /login.")
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
 
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Enter your mobile number (e.g., 9876543210):")
@@ -456,6 +428,7 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_all_courses.pop(user_id, None)
     user_free_categories.pop(user_id, None)
     context.user_data.clear()
+    logger.info(f"User {user_id} logged out manually.")
     await update.message.reply_text("✅ Logged out.")
 
 async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -501,6 +474,16 @@ async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data["login_step"] = None
     else:
         await update.message.reply_text("Please start with /login first.")
+
+async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if api and api.auth_token:
+        await update.message.reply_text(
+            f"✅ Session active.\nUser ID: {api.user_id}\nToken: {'Present' if api.auth_token else 'Missing'}\nMobile: {api.mobile}"
+        )
+    else:
+        await update.message.reply_text("❌ No active session. Use /login.")
 
 async def courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -808,6 +791,100 @@ async def notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if not api:
+        await update.message.reply_text("❌ Not logged in.")
+        return
+    try:
+        normal = api.all_courses(is_ebook=False)
+        ebook = api.all_courses(is_ebook=True)
+        data = {"normal": normal, "ebook": ebook}
+        filename = f"debug_{user_id}.json"
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        await update.message.reply_document(
+            document=open(filename, "rb"),
+            filename="debug_courses.json",
+            caption="Raw API responses for allCourses (isEBook=0 and isEBook=1)."
+        )
+        os.remove(filename)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if not api:
+        await update.message.reply_text("❌ Not logged in. Use /login first.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Please provide a course ID: /getcourse 91")
+        return
+
+    course_id = args[0].strip()
+    try:
+        # Fetch categories
+        categories_data = api.get_all_category(course_id)
+        categories = extract_categories(categories_data)
+        if not categories:
+            await update.message.reply_text(f"No categories found for course {course_id}.")
+            return
+
+        all_media = []
+        for cat in categories:
+            cat_id = cat["categoryId"]
+            cat_name = cat["categoryName"]
+            try:
+                videos_data = api.all_course_video(cat_id)
+                videos = extract_media_entries(videos_data)
+                all_media.extend(videos)
+            except:
+                pass
+            try:
+                pdfs_data = api.all_course_pdf(cat_id)
+                pdfs = extract_media_entries(pdfs_data)
+                all_media.extend(pdfs)
+            except:
+                pass
+            time.sleep(0.3)
+
+        seen = set()
+        unique = []
+        for url, title in all_media:
+            if url not in seen:
+                seen.add(url)
+                unique.append((url, title))
+
+        if not unique:
+            await update.message.reply_text(f"No media found for course {course_id}.")
+            return
+
+        # Build text file
+        lines = [f"Course ID: {course_id}"]
+        for i, (url, title) in enumerate(unique, 1):
+            lines.append(f"Entry {i}")
+            lines.append(f"Title: {title}")
+            lines.append(f"URL: {url}")
+            lines.append("")
+        content = "\n".join(lines)
+        filename = f"course_{course_id}_{user_id}.txt"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        await update.message.reply_document(
+            document=open(filename, "rb"),
+            filename=f"course_{course_id}_media.txt",
+            caption=f"✅ {len(unique)} media items for course ID {course_id}."
+        )
+        os.remove(filename)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❓ Unknown command. Use /start for help.")
 
@@ -817,10 +894,9 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("login", login))
     app.add_handler(CommandHandler("logout", logout))
-    app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("session", session_command))
     app.add_handler(CommandHandler("courses", courses))
     app.add_handler(CommandHandler("allcourses", allcourses))
@@ -829,6 +905,8 @@ def main():
     app.add_handler(CommandHandler("free_select", free_select))
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("notifications", notifications))
+    app.add_handler(CommandHandler("debug", debug_command))
+    app.add_handler(CommandHandler("getcourse", getcourse))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
