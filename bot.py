@@ -14,7 +14,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # -------------------------------------------------------------------
-# Logging & Health Server
+# Logging & Health Server (for Koyeb)
 # -------------------------------------------------------------------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -48,9 +48,7 @@ if not BOT_TOKEN:
 
 BASE_URL = "https://bridgetosuccess.learncentre.tech/public/study_api_v9/"
 PLAYER_URL = "https://lctplayer.learncentre.online/v/player.php?v="
-
 STORAGE = {
-    "video": "https://bridgetosuccess.learncentre.tech/public/storage/video/",
     "pdf": "https://bridgetosuccess.learncentre.tech/public/storage/pdf/",
     "timetable": "https://bridgetosuccess.learncentre.tech/public/storage/timetable/",
 }
@@ -62,7 +60,7 @@ user_all_courses = {}
 user_free_categories = {}
 
 # -------------------------------------------------------------------
-# Helper: stable device ID
+# Helper: stable device ID per user
 # -------------------------------------------------------------------
 def get_device_id(user_id: int) -> str:
     return hashlib.md5(str(user_id).encode()).hexdigest()[:16]
@@ -190,6 +188,9 @@ class BridgeToSuccessAPI:
 
     def get_all_category(self, course_id):
         return self.call("getAllCategory", courseId=course_id)
+
+    def get_category_mixed(self, course_id, category_id=""):
+        return self.call("getCategoryMixed", courseId=course_id, categoryId=category_id, userId=self.user_id)
 
     def course_info(self, course_id):
         return self.call("courseInfo", courseId=course_id, userId=self.user_id)
@@ -416,7 +417,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/debug – dump raw API response\n"
         "/debug_categories <course_id> – inspect categories API response\n"
         "/session – check session status\n"
-        "/getcourse <id> – fetch all videos/PDFs (including demo content) for a specific course ID\n"
+        "/getcourse <id> – fetch all content (including categories) for a specific course ID\n"
         "/help – this message"
     )
 
@@ -832,6 +833,7 @@ async def debug_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     course_id = args[0].strip()
     try:
+        # Try getAllCategory
         result = api.get_all_category(course_id)
         msg = f"🔍 **Debug Categories for course {course_id}**\n\n"
         msg += "**getAllCategory response:**\n```json\n" + json.dumps(result, indent=2) + "\n```\n"
@@ -855,81 +857,91 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_media = []
 
     try:
-        # 1. Fetch course info to get demo content
+        # 1. Use getCategoryMixed to fetch categories and their content
+        response = api.get_category_mixed(course_id, "")
+        mixed_list = None
+        if isinstance(response, dict):
+            for key in ["mixedContent", "data", "categories", "items"]:
+                if key in response and isinstance(response[key], list):
+                    mixed_list = response[key]
+                    break
+        if mixed_list is None and isinstance(response, list):
+            mixed_list = response
+
+        if mixed_list:
+            for item in mixed_list:
+                item_type = item.get("type")
+                data_obj = item.get("data", {})
+                title = data_obj.get("title") or data_obj.get("videoName") or data_obj.get("pdfTitle") or data_obj.get("testName") or data_obj.get("categoryName") or "Untitled"
+                if item_type == "category":
+                    all_media.append(("", f"📁 {title} (Folder)"))
+                elif item_type == "video":
+                    video_link = data_obj.get("videoLink")
+                    if video_link:
+                        if not video_link.startswith("http"):
+                            video_link = "https://bridgetosuccess.learncentre.tech/" + video_link.lstrip("/")
+                        all_media.append((video_link, title))
+                    else:
+                        all_media.append(("", f"🔒 {title} (Video - no URL)"))
+                elif item_type == "pdf":
+                    pdf_file = data_obj.get("pdfFile")
+                    if pdf_file:
+                        pdf_url = STORAGE["pdf"] + pdf_file
+                        all_media.append((pdf_url, title))
+                    else:
+                        all_media.append(("", f"🔒 {title} (PDF - no URL)"))
+                elif item_type == "test":
+                    test_id = data_obj.get("id")
+                    if test_id:
+                        all_media.append(("", f"📝 {title} (Test ID: {test_id})"))
+                    else:
+                        all_media.append(("", f"📝 {title} (Test)"))
+                else:
+                    all_media.append(("", f"📄 {title} (Unknown type: {item_type})"))
+        else:
+            # Fallback: try getAllCategory
+            cat_data = api.get_all_category(course_id)
+            categories = extract_categories(cat_data)
+            if categories:
+                for cat in categories:
+                    all_media.append(("", f"📁 {cat['categoryName']} (ID: {cat['categoryId']})"))
+
+        # 2. Add demo content from courseInfo
         info = api.course_info(course_id)
         if info and "courses" in info and len(info["courses"]) > 0:
             course = info["courses"][0]
             intro_video_id = course.get("introVideoId")
             batch_pdf = course.get("batchInfoPdf")
             timetable_img = course.get("timeTableImg")
-            # isPurchased = course.get("isPurchased", "0")
-
-            # Intro video (demo)
             if intro_video_id and intro_video_id != "null" and intro_video_id.strip():
                 video_url = PLAYER_URL + intro_video_id
                 all_media.append((video_url, "Intro Video (Demo)"))
-
-            # Batch info PDF (demo)
             if batch_pdf and batch_pdf.strip():
                 pdf_url = STORAGE["pdf"] + batch_pdf
                 all_media.append((pdf_url, "Batch Info PDF (Demo)"))
-
-            # Timetable image (demo)
             if timetable_img and timetable_img.strip():
                 img_url = STORAGE["timetable"] + timetable_img
                 all_media.append((img_url, "Timetable Image (Demo)"))
 
-        # 2. Try to get categories (only if purchased or if categories are available)
-        categories_data = api.get_all_category(course_id)
-        categories = extract_categories(categories_data)
-
-        if categories:
-            for cat in categories:
-                cat_id = cat["categoryId"]
-                cat_name = cat["categoryName"]
-                try:
-                    videos_data = api.all_course_video(cat_id)
-                    videos = extract_media_entries(videos_data)
-                    all_media.extend(videos)
-                except:
-                    pass
-                try:
-                    pdfs_data = api.all_course_pdf(cat_id)
-                    pdfs = extract_media_entries(pdfs_data)
-                    all_media.extend(pdfs)
-                except:
-                    pass
-                time.sleep(0.3)
-
         if not all_media:
-            # Check if course is purchased from info
-            is_purchased = "Unknown"
-            if info and "courses" in info and len(info["courses"]) > 0:
-                is_purchased = info["courses"][0].get("isPurchased", "Unknown")
-            msg = (
-                f"❌ No content found for course {course_id}.\n\n"
-                f"Purchase status: {is_purchased}\n"
-                "If the course is not purchased, only demo content (intro video, batch PDF) is available.\n"
-                "This course has no demo content visible.\n\n"
-                "Use `/debug_categories {course_id}` to inspect raw API responses."
-            )
-            await update.message.reply_text(msg)
+            await update.message.reply_text(f"No content found for course {course_id}.")
             return
 
-        # Deduplicate
+        # Deduplicate by URL (keep first)
         seen = set()
         unique = []
         for url, title in all_media:
-            if url not in seen:
-                seen.add(url)
-                unique.append((url, title))
+            if url in seen:
+                continue
+            seen.add(url)
+            unique.append((url, title))
 
         # Build file
         lines = [f"Course ID: {course_id}"]
         for i, (url, title) in enumerate(unique, 1):
             lines.append(f"Entry {i}")
             lines.append(f"Title: {title}")
-            lines.append(f"URL: {url}")
+            lines.append(f"URL: {url if url else '(No URL)'}")
             lines.append("")
         content = "\n".join(lines)
         filename = f"course_{course_id}_{user_id}.txt"
@@ -939,7 +951,7 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=open(filename, "rb"),
             filename=f"course_{course_id}_media.txt",
-            caption=f"✅ {len(unique)} media items for course {course_id} (including demo content)."
+            caption=f"✅ {len(unique)} items for course {course_id}."
         )
         os.remove(filename)
 
