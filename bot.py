@@ -3,27 +3,21 @@ import logging
 import os
 from typing import Dict
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Import the SDK
 from bridge_to_success_sdk import BridgeToSuccess, BTSAuthError, BTSAPIError
 
-# Enable logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Global store for user sessions (key: telegram user_id, value: BridgeToSuccess instance)
 user_sessions: Dict[int, BridgeToSuccess] = {}
 
-# Helper to run SDK methods in a thread
 async def run_sdk_method(method, *args, **kwargs):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: method(*args, **kwargs))
-
-# --- Bot command handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -42,8 +36,6 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /login <mobile> <password>")
         return
     mobile, password = args[0], args[1]
-
-    # Create a session store for this user (in-memory dict)
     store = {}
     app = BridgeToSuccess(session_store=store, verbose=False)
     try:
@@ -99,7 +91,6 @@ async def videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not vlist:
             await update.message.reply_text("No videos found.")
             return
-        # Build a message with clickable links (Markdown)
         msg = "🎬 *Videos:*\n\n"
         for v in vlist:
             title = v.get("title") or v.get("name") or "Untitled"
@@ -143,14 +134,12 @@ async def download_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not app or not app.is_logged_in():
         await update.message.reply_text("Please login first")
         return
-    # We'll download and send the file
     await update.message.reply_text("⏳ Downloading PDF...")
     try:
-        # Run download in thread
         save_path = await run_sdk_method(app.download_pdf, url_or_name, show_progress=False)
         with open(save_path, "rb") as f:
             await update.message.reply_document(document=f, filename=os.path.basename(save_path))
-        os.remove(save_path)  # cleanup
+        os.remove(save_path)
     except Exception as e:
         await update.message.reply_text(f"Download failed: {e}")
 
@@ -166,12 +155,10 @@ async def scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("⏳ Scraping course content (this may take a while)...")
     try:
-        # Run scrape in thread
         result = await run_sdk_method(app.scrape_course, course_id)
         msg = f"✅ Scraped *{result.get('course', '')}*\n"
         msg += f"Videos: {len(result.get('videos', []))}\n"
         msg += f"PDFs: {len(result.get('pdfs', []))}\n"
-        # Provide first few links as sample
         if result.get('videos'):
             msg += "\n*Sample video:*\n" + result['videos'][0].get('play_url', 'N/A')
         await update.message.reply_text(msg, parse_mode="Markdown")
@@ -181,18 +168,11 @@ async def scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
-# --- Main ---
-
 def main():
-    # Get token from environment variable
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
-
-    # Create the Application
     application = Application.builder().token(token).build()
-
-    # Command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("login", login))
@@ -202,8 +182,6 @@ def main():
     application.add_handler(CommandHandler("pdfs", pdfs))
     application.add_handler(CommandHandler("download_pdf", download_pdf))
     application.add_handler(CommandHandler("scrape", scrape))
-
-    # Start the bot
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
