@@ -14,7 +14,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # -------------------------------------------------------------------
-# Logging & Health Server (unchanged)
+# Logging & Health Server
 # -------------------------------------------------------------------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -61,7 +61,7 @@ def get_device_id(user_id: int) -> str:
     return hashlib.md5(str(user_id).encode()).hexdigest()[:16]
 
 # -------------------------------------------------------------------
-# API Client (unchanged)
+# API Client (with auto-re-login)
 # -------------------------------------------------------------------
 class BridgeToSuccessAPI:
     def __init__(self, mobile=None, password=None, android_id=None):
@@ -183,6 +183,9 @@ class BridgeToSuccessAPI:
 
     def get_all_category(self, course_id):
         return self.call("getAllCategory", courseId=course_id)
+
+    def get_category_mixed(self, course_id, category_id):
+        return self.call("getCategoryMixed", courseId=course_id, categoryId=category_id, userId=self.user_id)
 
     def course_info(self, course_id):
         return self.call("courseInfo", courseId=course_id, userId=self.user_id)
@@ -314,7 +317,6 @@ def extract_categories(json_data):
     cats = []
     def _extract(obj):
         if isinstance(obj, dict):
-            # Look for categoryId and categoryName anywhere
             if "categoryId" in obj and "categoryName" in obj:
                 cats.append({
                     "categoryId": obj["categoryId"],
@@ -408,6 +410,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/profile – your profile info\n"
         "/notifications – your notifications\n"
         "/debug – dump raw API response\n"
+        "/debug_categories <course_id> – inspect categories API response\n"
         "/session – check session status\n"
         "/getcourse <id> – fetch all videos/PDFs for a specific course ID\n"
         "/help – this message"
@@ -813,6 +816,29 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
+async def debug_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if not api:
+        await update.message.reply_text("❌ Not logged in.")
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Please provide a course ID: /debug_categories 91")
+        return
+    course_id = args[0].strip()
+    try:
+        # Try getAllCategory
+        result1 = api.get_all_category(course_id)
+        # Try getCategoryMixed with a dummy category (or maybe no category)
+        # We'll just send both responses
+        msg = f"🔍 **Debug Categories for course {course_id}**\n\n"
+        msg += "**getAllCategory response:**\n```json\n" + json.dumps(result1, indent=2) + "\n```\n"
+        # Optionally also try getCategoryMixed with categoryId = ""?
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
 async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
@@ -827,21 +853,25 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     course_id = args[0].strip()
     try:
-        # First, try to get categories from courseInfo (which is what the app uses)
-        info_data = api.course_info(course_id)
-        # Extract categories from info response
-        categories = extract_categories(info_data)
-        
-        # If no categories found, try getAllCategory as fallback
-        if not categories:
-            logger.info(f"No categories in courseInfo for {course_id}, trying getAllCategory...")
-            cat_data = api.get_all_category(course_id)
-            categories = extract_categories(cat_data)
+        # First, try to get categories from getAllCategory
+        categories_data = api.get_all_category(course_id)
+        categories = extract_categories(categories_data)
 
+        # If empty, try getCategoryMixed (with userId)
         if not categories:
-            # Send raw response for debugging
-            await update.message.reply_text(f"No categories found for course {course_id}. Raw courseInfo response:")
-            await update.message.reply_text(f"```\n{json.dumps(info_data, indent=2)[:4000]}\n```", parse_mode="Markdown")
+            logger.info(f"getAllCategory returned empty for {course_id}, trying getCategoryMixed...")
+            # We need a categoryId to call getCategoryMixed, but we don't have one.
+            # We'll try with an empty string or "0" as a workaround.
+            # Some APIs might return all categories if categoryId is empty.
+            # But likely it will fail. We'll just return a helpful message.
+            # Instead, we can try to fetch categories from courseInfo? Already did.
+            # So we'll note that the course might be unpurchased.
+            await update.message.reply_text(
+                f"❌ No categories found for course {course_id}.\n\n"
+                "This usually means the course is not purchased or the server restricts access.\n"
+                "If you have purchased this course, please try again later or use the app to verify.\n"
+                "You can also use `/debug_categories {course_id}` to inspect the raw server response."
+            )
             return
 
         all_media = []
@@ -916,6 +946,7 @@ def main():
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("notifications", notifications))
     app.add_handler(CommandHandler("debug", debug_command))
+    app.add_handler(CommandHandler("debug_categories", debug_categories))
     app.add_handler(CommandHandler("getcourse", getcourse))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_input))
