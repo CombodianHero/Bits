@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict
 
 from telegram import Update
@@ -8,32 +10,36 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from bridge_to_success_sdk import BridgeToSuccess, BTSAuthError, BTSAPIError
 
+# ─── Logging ──────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# ─── In-memory sessions ─────────────────────────────────────────
 user_sessions: Dict[int, BridgeToSuccess] = {}
 
+# ─── SDK executor ──────────────────────────────────────────────
 async def run_sdk_method(method, *args, **kwargs):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: method(*args, **kwargs))
 
+# ─── Bot command handlers ──────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Plain text – no Markdown to avoid parse errors
     await update.message.reply_text(
-        "🎓 *Bridge to Success Bot*\n\n"
+        "🎓 Bridge to Success Bot\n\n"
         "I can help you access your courses, videos, and PDFs.\n"
-        "Use /login `mobile` `password` to authenticate.\n"
+        "Use /login mobile password to authenticate.\n"
         "Then try /courses, /videos, /pdfs, /scrape, /download_pdf.\n"
-        "Use /logout to clear your session.",
-        parse_mode="Markdown"
+        "Use /logout to clear your session."
     )
 
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("Usage: /login `mobile` `password`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: /login mobile password")
         return
     mobile, password = args[0], args[1]
     store = {}
@@ -79,7 +85,7 @@ async def courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 3:
-        await update.message.reply_text("Usage: /videos `course_id` `subject_id` `chapter_id`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: /videos course_id subject_id chapter_id")
         return
     course_id, subject_id, chapter_id = args[0], args[1], args[2]
     app = user_sessions.get(update.effective_user.id)
@@ -95,6 +101,7 @@ async def videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for v in vlist:
             title = v.get("title") or v.get("name") or "Untitled"
             url = v.get("play_url") or "No URL"
+            # Use inline links – Markdown is safe here
             msg += f"• [{title}]({url})\n"
         await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
     except Exception as e:
@@ -103,7 +110,7 @@ async def videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pdfs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 3:
-        await update.message.reply_text("Usage: /pdfs `course_id` `subject_id` `chapter_id`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: /pdfs course_id subject_id chapter_id")
         return
     course_id, subject_id, chapter_id = args[0], args[1], args[2]
     app = user_sessions.get(update.effective_user.id)
@@ -127,7 +134,7 @@ async def pdfs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def download_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 1:
-        await update.message.reply_text("Usage: /download_pdf `pdf_url_or_filename`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: /download_pdf pdf_url_or_filename")
         return
     url_or_name = args[0]
     app = user_sessions.get(update.effective_user.id)
@@ -146,7 +153,7 @@ async def download_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 1:
-        await update.message.reply_text("Usage: /scrape `course_id`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: /scrape course_id")
         return
     course_id = args[0]
     app = user_sessions.get(update.effective_user.id)
@@ -168,11 +175,30 @@ async def scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
+# ─── Simple HTTP server for Koyeb health checks ────────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def run_http_server():
+    server = HTTPServer(("0.0.0.0", 8000), HealthHandler)
+    logger.info("Health check server running on port 8000")
+    server.serve_forever()
+
+# ─── Main ──────────────────────────────────────────────────────
 def main():
+    # Start HTTP server in a background thread
+    thread = threading.Thread(target=run_http_server, daemon=True)
+    thread.start()
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
+
     application = Application.builder().token(token).build()
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("login", login))
@@ -182,6 +208,8 @@ def main():
     application.add_handler(CommandHandler("pdfs", pdfs))
     application.add_handler(CommandHandler("download_pdf", download_pdf))
     application.add_handler(CommandHandler("scrape", scrape))
+
+    # Start polling (this will block)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
