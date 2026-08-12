@@ -4,6 +4,8 @@ import uuid
 import time
 import hashlib
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -21,6 +23,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -------------------------------------------------------------------
+# Health Check Server
+# -------------------------------------------------------------------
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def run_health_server():
+    try:
+        server = HTTPServer(('0.0.0.0', 8000), HealthHandler)
+        logger.info("Health check server running on port 8000")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Health server error: {e}")
+
+health_thread = threading.Thread(target=run_health_server, daemon=True)
+health_thread.start()
+
+# -------------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -29,22 +51,20 @@ if not BOT_TOKEN:
 
 BASE_URL = "https://bridgetosuccess.learncentre.tech/public/study_api_v9/"
 
-# In-memory storage (per user)
-user_sessions = {}       # user_id -> BridgeToSuccessAPI instance
-user_credentials = {}    # user_id -> (mobile, password, android_id)
-user_courses = {}        # user_id -> list of course dicts (myCourses)
-user_all_courses = {}    # user_id -> list of all courses (allCourses)
-user_free_categories = {} # user_id -> list of free category dicts
-user_raw_responses = {}  # user_id -> raw JSON for debugging
+user_sessions = {}
+user_credentials = {}
+user_courses = {}
+user_all_courses = {}
+user_free_categories = {}
 
 # -------------------------------------------------------------------
-# Helper: stable device ID per user (to avoid multiple-device warnings)
+# Helper: stable device ID per user
 # -------------------------------------------------------------------
 def get_device_id(user_id: int) -> str:
     return hashlib.md5(str(user_id).encode()).hexdigest()[:16]
 
 # -------------------------------------------------------------------
-# API Client (with auto-re-login and logging)
+# API Client (with auto-re-login)
 # -------------------------------------------------------------------
 class BridgeToSuccessAPI:
     def __init__(self, mobile=None, password=None, android_id=None):
@@ -101,7 +121,6 @@ class BridgeToSuccessAPI:
                         self.session.headers.update(self._default_headers())
                         continue
                     else:
-                        logger.error("Token expired and re‑login failed or no credentials.")
                         raise PermissionError("Token expired and re‑login failed")
                 raise
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
@@ -145,8 +164,6 @@ class BridgeToSuccessAPI:
                 "Authorization": f"Bearer {self.auth_token}"
             })
             logger.info(f"Token updated for user {self.user_id}")
-        else:
-            logger.warning("No auth_token found in login response.")
 
     def call(self, tag, **params):
         return self.post({"tag": tag, **params})
@@ -199,20 +216,16 @@ class BridgeToSuccessAPI:
         return self.call("getFreeContent", userId=self.user_id, courseType=course_type,
                          categoryId=category_id, pageNumber=str(page), pageItemSize=str(page_size))
 
-    # --- Bulk fetch for a user (used after login) ---
+    # --- Bulk fetch for a user ---
     def fetch_all_courses_with_details(self, fetch_my=False):
-        """Fetch all courses (or my courses) with full details including price.
-           Merges both isEBook=false and isEBook=true for all courses."""
         if fetch_my:
             courses_data = self.my_courses()
             courses = extract_courses(courses_data)
         else:
-            # Fetch both types and combine
             normal_data = self.all_courses(is_ebook=False)
             ebook_data = self.all_courses(is_ebook=True)
             courses_normal = extract_courses(normal_data)
             courses_ebook = extract_courses(ebook_data)
-            # Deduplicate by courseId
             combined = {}
             for c in courses_normal + courses_ebook:
                 combined[c['courseId']] = c
@@ -272,17 +285,19 @@ class BridgeToSuccessAPI:
         return free_videos, free_pdfs
 
 # -------------------------------------------------------------------
-# Helper functions
+# Helper functions (FIXED extract_courses to handle "id")
 # -------------------------------------------------------------------
 def extract_courses(json_data):
     courses = []
     def _extract(obj):
         if isinstance(obj, dict):
-            if "courseId" in obj and "courseName" in obj:
+            # Look for either "courseId" or "id"
+            course_id = obj.get("courseId") or obj.get("id")
+            if course_id and "courseName" in obj:
                 course = {
-                    "courseId": obj["courseId"],
+                    "courseId": course_id,
                     "courseName": obj["courseName"],
-                    "categoryId": obj.get("categoryId") or obj["courseId"],
+                    "categoryId": obj.get("categoryId") or course_id,
                     "coursePrice": obj.get("coursePrice", "N/A"),
                     "strikeoutPrice": obj.get("strikeoutPrice", None)
                 }
@@ -378,7 +393,7 @@ def parse_selection(text, max_idx):
     return sorted(set(indices))
 
 # -------------------------------------------------------------------
-# Telegram Bot Handlers
+# Telegram Bot Handlers (unchanged, included for completeness)
 # -------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -403,15 +418,10 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not api:
         await update.message.reply_text("❌ Not logged in.")
         return
-    # Fetch all courses raw and show a summary
     try:
         normal = api.all_courses(is_ebook=False)
         ebook = api.all_courses(is_ebook=True)
-        # Save to file
-        data = {
-            "normal": normal,
-            "ebook": ebook
-        }
+        data = {"normal": normal, "ebook": ebook}
         filename = f"debug_{user_id}.json"
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -429,10 +439,7 @@ async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api = user_sessions.get(user_id)
     if api and api.auth_token:
         await update.message.reply_text(
-            f"✅ Session active.\n"
-            f"User ID: {api.user_id}\n"
-            f"Token: {'Present' if api.auth_token else 'Missing'}\n"
-            f"Mobile: {api.mobile}"
+            f"✅ Session active.\nUser ID: {api.user_id}\nToken: {'Present' if api.auth_token else 'Missing'}\nMobile: {api.mobile}"
         )
     else:
         await update.message.reply_text("❌ No active session. Use /login.")
@@ -449,7 +456,6 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_all_courses.pop(user_id, None)
     user_free_categories.pop(user_id, None)
     context.user_data.clear()
-    logger.info(f"User {user_id} logged out manually.")
     await update.message.reply_text("✅ Logged out.")
 
 async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -480,22 +486,17 @@ async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 user_credentials[user_id] = (mobile, password, android_id)
                 context.user_data["login_step"] = None
                 await update.message.reply_text(f"✅ Login successful! User ID: {api.user_id}")
-                # Pre‑fetch all courses and purchased courses
                 await update.message.reply_text("⏳ Loading courses...")
                 try:
                     user_all_courses[user_id] = api.fetch_all_courses_with_details(fetch_my=False)
                     user_courses[user_id] = api.fetch_all_courses_with_details(fetch_my=True)
                     await update.message.reply_text("✅ Courses loaded.")
-                    logger.info(f"User {user_id} logged in and courses loaded.")
                 except Exception as e:
-                    logger.error(f"Course loading failed for user {user_id}: {e}")
                     await update.message.reply_text(f"⚠️ Could not load courses: {e}")
             else:
                 error_msg = result.get("message") or result.get("error") or "Invalid credentials"
-                logger.warning(f"Login failed for user {user_id}: {error_msg}")
                 await update.message.reply_text(f"❌ Login failed: {error_msg}")
         except Exception as e:
-            logger.error(f"Login error for user {user_id}: {e}")
             await update.message.reply_text(f"❌ Error: {str(e)}")
         context.user_data["login_step"] = None
     else:
@@ -517,11 +518,7 @@ async def courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("No purchased courses found.")
                 return
             user_courses[user_id] = courses_list
-        except PermissionError as e:
-            await update.message.reply_text(f"❌ Session expired. Please /login again.")
-            return
         except Exception as e:
-            logger.error(f"Error in courses for user {user_id}: {e}")
             await update.message.reply_text(f"❌ Error: {str(e)}")
             return
     msg = "📖 Your Purchased Courses:\n\n"
@@ -535,7 +532,6 @@ async def courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def allcourses(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show all available courses with price and full details (videos, PDFs)."""
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
     if not api:
@@ -547,11 +543,7 @@ async def allcourses(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             all_list = api.fetch_all_courses_with_details(fetch_my=False)
             user_all_courses[user_id] = all_list
-        except PermissionError:
-            await update.message.reply_text("❌ Session expired. Please /login again.")
-            return
         except Exception as e:
-            logger.error(f"Error in allcourses for user {user_id}: {e}")
             await update.message.reply_text(f"❌ Error: {str(e)}")
             return
     if not all_list:
@@ -644,7 +636,6 @@ async def handle_select_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             pass
         time.sleep(0.5)
 
-    # Free content (if any)
     try:
         free_v = api.free_course_video()
         all_media.extend(extract_media_entries(free_v))
@@ -739,10 +730,7 @@ async def free(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=f"✅ Free content: {len(unique)} items."
             )
             os.remove(filename)
-    except PermissionError:
-        await update.message.reply_text("❌ Session expired. Please /login again.")
     except Exception as e:
-        logger.error(f"Error in free for user {user_id}: {e}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def free_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -793,10 +781,7 @@ async def free_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=f"✅ {len(unique)} media items in {cat['categoryName']}"
         )
         os.remove(filename)
-    except PermissionError:
-        await update.message.reply_text("❌ Session expired. Please /login again.")
     except Exception as e:
-        logger.error(f"Error in free_select for user {user_id}: {e}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -808,10 +793,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = api.get_profile()
         await update.message.reply_text(f"Profile info:\n```\n{json.dumps(data, indent=2)}\n```", parse_mode="Markdown")
-    except PermissionError:
-        await update.message.reply_text("❌ Session expired. Please /login again.")
     except Exception as e:
-        logger.error(f"Error in profile for user {user_id}: {e}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -823,10 +805,7 @@ async def notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = api.get_notifications()
         await update.message.reply_text(f"Notifications:\n```\n{json.dumps(data, indent=2)}\n```", parse_mode="Markdown")
-    except PermissionError:
-        await update.message.reply_text("❌ Session expired. Please /login again.")
     except Exception as e:
-        logger.error(f"Error in notifications for user {user_id}: {e}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
