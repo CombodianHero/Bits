@@ -14,7 +14,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # -------------------------------------------------------------------
-# Logging
+# Logging & Health Server (unchanged)
 # -------------------------------------------------------------------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -22,9 +22,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------------------
-# Health Check Server (for Koyeb)
-# -------------------------------------------------------------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -51,20 +48,20 @@ if not BOT_TOKEN:
 
 BASE_URL = "https://bridgetosuccess.learncentre.tech/public/study_api_v9/"
 
-user_sessions = {}          # user_id -> BridgeToSuccessAPI instance
-user_credentials = {}       # user_id -> (mobile, password, android_id)
-user_courses = {}           # user_id -> list of purchased courses
-user_all_courses = {}       # user_id -> list of all courses
-user_free_categories = {}   # user_id -> list of free categories
+user_sessions = {}
+user_credentials = {}
+user_courses = {}
+user_all_courses = {}
+user_free_categories = {}
 
 # -------------------------------------------------------------------
-# Helper: stable device ID per user
+# Helper: stable device ID
 # -------------------------------------------------------------------
 def get_device_id(user_id: int) -> str:
     return hashlib.md5(str(user_id).encode()).hexdigest()[:16]
 
 # -------------------------------------------------------------------
-# API Client (with auto-re-login)
+# API Client (unchanged)
 # -------------------------------------------------------------------
 class BridgeToSuccessAPI:
     def __init__(self, mobile=None, password=None, android_id=None):
@@ -187,6 +184,9 @@ class BridgeToSuccessAPI:
     def get_all_category(self, course_id):
         return self.call("getAllCategory", courseId=course_id)
 
+    def course_info(self, course_id):
+        return self.call("courseInfo", courseId=course_id, userId=self.user_id)
+
     def all_course_video(self, category_id):
         return self.call("allCourseVideo", categoryId=category_id, userId=self.user_id)
 
@@ -291,7 +291,6 @@ def extract_courses(json_data):
     courses = []
     def _extract(obj):
         if isinstance(obj, dict):
-            # Accept both "id" and "courseId"
             course_id = obj.get("courseId") or obj.get("id")
             if course_id and "courseName" in obj:
                 course = {
@@ -315,6 +314,7 @@ def extract_categories(json_data):
     cats = []
     def _extract(obj):
         if isinstance(obj, dict):
+            # Look for categoryId and categoryName anywhere
             if "categoryId" in obj and "categoryName" in obj:
                 cats.append({
                     "categoryId": obj["categoryId"],
@@ -827,11 +827,21 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     course_id = args[0].strip()
     try:
-        # Fetch categories
-        categories_data = api.get_all_category(course_id)
-        categories = extract_categories(categories_data)
+        # First, try to get categories from courseInfo (which is what the app uses)
+        info_data = api.course_info(course_id)
+        # Extract categories from info response
+        categories = extract_categories(info_data)
+        
+        # If no categories found, try getAllCategory as fallback
         if not categories:
-            await update.message.reply_text(f"No categories found for course {course_id}.")
+            logger.info(f"No categories in courseInfo for {course_id}, trying getAllCategory...")
+            cat_data = api.get_all_category(course_id)
+            categories = extract_categories(cat_data)
+
+        if not categories:
+            # Send raw response for debugging
+            await update.message.reply_text(f"No categories found for course {course_id}. Raw courseInfo response:")
+            await update.message.reply_text(f"```\n{json.dumps(info_data, indent=2)[:4000]}\n```", parse_mode="Markdown")
             return
 
         all_media = []
