@@ -400,6 +400,33 @@ def parse_selection(text, max_idx):
     return sorted(set(indices))
 
 # -------------------------------------------------------------------
+# Helper to get leaf category IDs recursively from getAllCategory response
+# -------------------------------------------------------------------
+def get_leaf_category_ids(category_list):
+    """
+    Recursively traverse a category tree (list of categories with 'children')
+    and return a list of dicts {id, name, full_path} for leaf categories.
+    """
+    leaves = []
+    def traverse(cat, path):
+        current_path = path + [cat.get("categoryName", "Unknown")]
+        if cat.get("hasChild") == "0" or not cat.get("children"):
+            leaves.append({
+                "id": cat["id"],
+                "name": cat.get("categoryName", "Unknown"),
+                "path": " → ".join(current_path)
+            })
+        else:
+            for child in cat.get("children", []):
+                traverse(child, current_path)
+    if isinstance(category_list, list):
+        for cat in category_list:
+            traverse(cat, [])
+    elif isinstance(category_list, dict):
+        traverse(category_list, [])
+    return leaves
+
+# -------------------------------------------------------------------
 # Telegram Bot Handlers
 # -------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -870,56 +897,60 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_media = []
 
     try:
-        # 1. Use getCategoryMixed to fetch categories and their content
-        response = api.get_category_mixed(course_id, "")
-        mixed_list = None
-        if isinstance(response, dict):
-            for key in ["mixedContent", "data", "categories", "items"]:
-                if key in response and isinstance(response[key], list):
-                    mixed_list = response[key]
-                    break
-        if mixed_list is None and isinstance(response, list):
-            mixed_list = response
+        # 1. Fetch categories from getAllCategory (full tree)
+        category_response = api.get_all_category(course_id)
+        category_list = None
+        if isinstance(category_response, dict) and "category" in category_response:
+            category_list = category_response["category"]
 
-        if mixed_list:
-            for item in mixed_list:
-                item_type = item.get("type")
-                data_obj = item.get("data", {})
-                title = data_obj.get("title") or data_obj.get("videoName") or data_obj.get("pdfTitle") or data_obj.get("testName") or data_obj.get("categoryName") or "Untitled"
-                if item_type == "category":
-                    all_media.append(("", f"📁 {title} (Folder)"))
-                elif item_type == "video":
-                    video_link = data_obj.get("videoLink")
-                    if video_link:
-                        if not video_link.startswith("http"):
-                            video_link = "https://bridgetosuccess.learncentre.tech/" + video_link.lstrip("/")
-                        all_media.append((video_link, title))
-                    else:
-                        all_media.append(("", f"🔒 {title} (Video - no URL)"))
-                elif item_type == "pdf":
-                    pdf_file = data_obj.get("pdfFile")
-                    if pdf_file:
-                        pdf_url = STORAGE["pdf"] + pdf_file
-                        all_media.append((pdf_url, title))
-                    else:
-                        all_media.append(("", f"🔒 {title} (PDF - no URL)"))
-                elif item_type == "test":
-                    test_id = data_obj.get("id")
-                    if test_id:
-                        all_media.append(("", f"📝 {title} (Test ID: {test_id})"))
-                    else:
-                        all_media.append(("", f"📝 {title} (Test)"))
-                else:
-                    all_media.append(("", f"📄 {title} (Unknown type: {item_type})"))
-        else:
-            # Fallback: try getAllCategory
-            cat_data = api.get_all_category(course_id)
-            categories = extract_categories(cat_data)
-            if categories:
-                for cat in categories:
-                    all_media.append(("", f"📁 {cat['categoryName']} (ID: {cat['categoryId']})"))
+        if category_list:
+            # Get leaf categories
+            leaves = get_leaf_category_ids(category_list)
+            if leaves:
+                for leaf in leaves:
+                    cat_id = leaf["id"]
+                    cat_path = leaf["path"]
+                    # Fetch videos and PDFs for this leaf category
+                    try:
+                        videos_data = api.all_course_video(cat_id)
+                        videos = extract_media_entries(videos_data)
+                        for url, title in videos:
+                            all_media.append((url, f"{cat_path} → {title}"))
+                    except Exception as e:
+                        logger.warning(f"Video fetch error for category {cat_id}: {e}")
+                    try:
+                        pdfs_data = api.all_course_pdf(cat_id)
+                        pdfs = extract_media_entries(pdfs_data)
+                        for url, title in pdfs:
+                            all_media.append((url, f"{cat_path} → {title}"))
+                    except Exception as e:
+                        logger.warning(f"PDF fetch error for category {cat_id}: {e}")
+                    time.sleep(0.3)
 
-        # 2. Add demo content from courseInfo
+        # 2. Fallback: if no categories from getAllCategory, try getCategoryMixed
+        if not all_media:
+            mixed_response = api.get_category_mixed(course_id, "")
+            mixed_list = None
+            if isinstance(mixed_response, dict):
+                for key in ["mixedContent", "data", "items"]:
+                    if key in mixed_response and isinstance(mixed_response[key], list):
+                        mixed_list = mixed_response[key]
+                        break
+            if mixed_list is None and isinstance(mixed_response, list):
+                mixed_list = mixed_response
+
+            if mixed_list:
+                for item in mixed_list:
+                    if item.get("type") == "category":
+                        data_obj = item.get("data", {})
+                        cat_id = data_obj.get("id")
+                        cat_name = data_obj.get("categoryName", "Unknown")
+                        # For top-level categories, we can't get media directly; we'd need to fetch sub-categories.
+                        # But we already tried getAllCategory, so this is just a fallback.
+                        # We'll add a placeholder entry.
+                        all_media.append(("", f"📁 {cat_name} (Category - check sub-categories)"))
+
+        # 3. Add demo content from courseInfo
         info = api.course_info(course_id)
         if info and "courses" in info and len(info["courses"]) > 0:
             course = info["courses"][0]
