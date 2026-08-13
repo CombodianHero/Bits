@@ -14,7 +14,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # -------------------------------------------------------------------
-# Logging & Health Server (for Koyeb)
+# Logging & Health Server
 # -------------------------------------------------------------------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -410,6 +410,7 @@ def get_leaf_category_ids(category_list):
     leaves = []
     def traverse(cat, path):
         current_path = path + [cat.get("categoryName", "Unknown")]
+        # Check if leaf: hasChild == "0" or children empty
         if cat.get("hasChild") == "0" or not cat.get("children"):
             leaves.append({
                 "id": cat["id"],
@@ -860,9 +861,7 @@ async def debug_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     course_id = args[0].strip()
     try:
-        # Try getAllCategory
         result = api.get_all_category(course_id)
-        # Also try getCategoryMixed for comparison
         mixed_result = api.get_category_mixed(course_id, "")
         data = {
             "course_id": course_id,
@@ -910,19 +909,22 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for leaf in leaves:
                     cat_id = leaf["id"]
                     cat_path = leaf["path"]
-                    # Fetch videos and PDFs for this leaf category
+                    # Add folder entry for this leaf category
+                    all_media.append(("", f"📁 {cat_path}"))
+                    # Fetch videos for this leaf category
                     try:
                         videos_data = api.all_course_video(cat_id)
                         videos = extract_media_entries(videos_data)
                         for url, title in videos:
-                            all_media.append((url, f"{cat_path} → {title}"))
+                            all_media.append((url, f"  → {title}"))
                     except Exception as e:
                         logger.warning(f"Video fetch error for category {cat_id}: {e}")
+                    # Fetch PDFs for this leaf category
                     try:
                         pdfs_data = api.all_course_pdf(cat_id)
                         pdfs = extract_media_entries(pdfs_data)
                         for url, title in pdfs:
-                            all_media.append((url, f"{cat_path} → {title}"))
+                            all_media.append((url, f"  → {title}"))
                     except Exception as e:
                         logger.warning(f"PDF fetch error for category {cat_id}: {e}")
                     time.sleep(0.3)
@@ -943,12 +945,8 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for item in mixed_list:
                     if item.get("type") == "category":
                         data_obj = item.get("data", {})
-                        cat_id = data_obj.get("id")
                         cat_name = data_obj.get("categoryName", "Unknown")
-                        # For top-level categories, we can't get media directly; we'd need to fetch sub-categories.
-                        # But we already tried getAllCategory, so this is just a fallback.
-                        # We'll add a placeholder entry.
-                        all_media.append(("", f"📁 {cat_name} (Category - check sub-categories)"))
+                        all_media.append(("", f"📁 {cat_name} (Category)"))
 
         # 3. Add demo content from courseInfo
         info = api.course_info(course_id)
