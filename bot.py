@@ -105,7 +105,6 @@ class BridgeToSuccessAPI:
         return headers
 
     def set_token(self, user_id, auth_token):
-        """Manually set user_id and auth_token without login."""
         self.user_id = user_id
         self.auth_token = auth_token
         self.session.headers.update(self._default_headers())
@@ -410,10 +409,6 @@ def parse_selection(text, max_idx):
 # Helper to get leaf category IDs recursively from getAllCategory response
 # -------------------------------------------------------------------
 def get_leaf_category_ids(category_list):
-    """
-    Recursively traverse a category tree (list of categories with 'children')
-    and return a list of dicts {id, name, full_path} for leaf categories.
-    """
     leaves = []
     def traverse(cat, path):
         current_path = path + [cat.get("categoryName", "Unknown")]
@@ -477,17 +472,11 @@ async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         api = BridgeToSuccessAPI()
         api.set_token(uid, token)
-        # Test the token by calling a lightweight endpoint (e.g., get_profile)
-        # If it fails, the token is invalid.
         try:
-            # Use a short timeout to avoid hanging
             profile = api.get_profile()
-            # If we get here, token works
             user_sessions[user_id] = api
-            user_credentials[user_id] = (None, None, None)  # no mobile/password
-            # Optionally pre-fetch courses? Skipping to keep it fast.
+            user_credentials[user_id] = (None, None, None)
             await update.message.reply_text(f"✅ Login successful via token!\nUser ID: {uid}")
-            # Optionally load courses in background
             await update.message.reply_text("⏳ Loading courses...")
             try:
                 user_all_courses[user_id] = api.fetch_all_courses_with_details(fetch_my=False)
@@ -496,7 +485,6 @@ async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 await update.message.reply_text(f"⚠️ Could not load courses: {e}")
         except Exception as e:
-            # Token likely invalid
             await update.message.reply_text(f"❌ Token validation failed: {str(e)}")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
@@ -654,7 +642,7 @@ async def select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
     if not api:
-        await update.message.reply_text("❌ Not logged in. Use /login or /login_token first.")
+        await update.message.reply_text("❌ Not logged in.")
         return
     courses_list = user_courses.get(user_id) or user_all_courses.get(user_id)
     if not courses_list:
@@ -941,7 +929,7 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_media = []
 
     try:
-        # 1. Fetch categories from getAllCategory (full tree)
+        # 1. Fetch category tree
         category_response = api.get_all_category(course_id)
         category_list = None
         if isinstance(category_response, dict) and "category" in category_response:
@@ -955,35 +943,82 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     cat_path = leaf["path"]
                     # Add folder entry
                     all_media.append(("", f"📁 {cat_path}"))
-                    # Fetch videos
+
+                    # Fetch media for this leaf category
                     try:
-                        videos_data = api.all_course_video(cat_id)
-                        videos = extract_media_entries(videos_data)
-                        for url, title in videos:
-                            all_media.append((url, f"  → {title}"))
-                    except Exception:
-                        pass
-                    # Fetch PDFs
-                    try:
-                        pdfs_data = api.all_course_pdf(cat_id)
-                        pdfs = extract_media_entries(pdfs_data)
-                        for url, title in pdfs:
-                            all_media.append((url, f"  → {title}"))
-                    except Exception:
-                        pass
+                        media_response = api.get_category_mixed(course_id, cat_id)
+                        # Extract list of mixed content items from various possible structures
+                        mixed_items = None
+                        if isinstance(media_response, list):
+                            mixed_items = media_response
+                        elif isinstance(media_response, dict):
+                            # Try common keys
+                            for key in ["mixedContentItems", "mixedContent", "data", "items"]:
+                                if key in media_response and isinstance(media_response[key], list):
+                                    mixed_items = media_response[key]
+                                    break
+                            # If not found, maybe the dict itself has the items as values?
+                            if mixed_items is None:
+                                # Sometimes it's {"success":1, "data": {"mixedContentItems": [...]}}
+                                if "data" in media_response and isinstance(media_response["data"], dict):
+                                    data_obj = media_response["data"]
+                                    for key in ["mixedContentItems", "mixedContent", "items"]:
+                                        if key in data_obj and isinstance(data_obj[key], list):
+                                            mixed_items = data_obj[key]
+                                            break
+                                # Or even {"data": [...]}
+                                elif "data" in media_response and isinstance(media_response["data"], list):
+                                    mixed_items = media_response["data"]
+
+                        if mixed_items:
+                            for item in mixed_items:
+                                item_type = item.get("type")
+                                data_obj = item.get("data", {})
+                                if item_type == "video":
+                                    title = data_obj.get("videoName", "Video")
+                                    video_link = data_obj.get("videoLink")
+                                    if video_link:
+                                        if not video_link.startswith("http"):
+                                            video_link = "https://bridgetosuccess.learncentre.tech/" + video_link.lstrip("/")
+                                        all_media.append((video_link, f"  → {title}"))
+                                    else:
+                                        all_media.append(("", f"  → {title} (No URL)"))
+                                elif item_type == "pdf":
+                                    title = data_obj.get("pdfTitle", "PDF")
+                                    pdf_file = data_obj.get("pdfFile")
+                                    if pdf_file:
+                                        pdf_url = STORAGE["pdf"] + pdf_file
+                                        all_media.append((pdf_url, f"  → {title}"))
+                                    else:
+                                        all_media.append(("", f"  → {title} (No URL)"))
+                        else:
+                            # No media found for this leaf
+                            all_media.append(("", f"  → (No media in this category)"))
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch media for category {cat_id}: {e}")
+                        all_media.append(("", f"  → (Error fetching media)"))
                     time.sleep(0.3)
 
-        # 2. Fallback: if no categories, try getCategoryMixed
+        # 2. Fallback: if no categories, try getCategoryMixed with empty categoryId
         if not all_media:
             mixed_response = api.get_category_mixed(course_id, "")
             mixed_list = None
-            if isinstance(mixed_response, dict):
-                for key in ["mixedContent", "data", "items"]:
+            if isinstance(mixed_response, list):
+                mixed_list = mixed_response
+            elif isinstance(mixed_response, dict):
+                for key in ["mixedContentItems", "mixedContent", "data", "items"]:
                     if key in mixed_response and isinstance(mixed_response[key], list):
                         mixed_list = mixed_response[key]
                         break
-            if mixed_list is None and isinstance(mixed_response, list):
-                mixed_list = mixed_response
+                if mixed_list is None and "data" in mixed_response:
+                    data_obj = mixed_response["data"]
+                    if isinstance(data_obj, dict):
+                        for key in ["mixedContentItems", "mixedContent", "items"]:
+                            if key in data_obj and isinstance(data_obj[key], list):
+                                mixed_list = data_obj[key]
+                                break
+                    elif isinstance(data_obj, list):
+                        mixed_list = data_obj
 
             if mixed_list:
                 for item in mixed_list:
@@ -991,6 +1026,25 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         data_obj = item.get("data", {})
                         cat_name = data_obj.get("categoryName", "Unknown")
                         all_media.append(("", f"📁 {cat_name} (Category)"))
+                    elif item.get("type") == "video":
+                        data_obj = item.get("data", {})
+                        title = data_obj.get("videoName", "Video")
+                        video_link = data_obj.get("videoLink")
+                        if video_link:
+                            if not video_link.startswith("http"):
+                                video_link = "https://bridgetosuccess.learncentre.tech/" + video_link.lstrip("/")
+                            all_media.append((video_link, title))
+                        else:
+                            all_media.append(("", f"{title} (No URL)"))
+                    elif item.get("type") == "pdf":
+                        data_obj = item.get("data", {})
+                        title = data_obj.get("pdfTitle", "PDF")
+                        pdf_file = data_obj.get("pdfFile")
+                        if pdf_file:
+                            pdf_url = STORAGE["pdf"] + pdf_file
+                            all_media.append((pdf_url, title))
+                        else:
+                            all_media.append(("", f"{title} (No URL)"))
 
         # 3. Add demo content from courseInfo
         info = api.course_info(course_id)
@@ -1013,7 +1067,7 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"No content found for course {course_id}.")
             return
 
-        # 4. Deduplicate – use URL if non‑empty, otherwise use title
+        # Deduplicate – use URL if non‑empty, otherwise use title
         seen = set()
         unique = []
         for url, title in all_media:
@@ -1023,7 +1077,7 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
             seen.add(key)
             unique.append((url, title))
 
-        # 5. Build and send file
+        # Build and send file
         lines = [f"Course ID: {course_id}"]
         for i, (url, title) in enumerate(unique, 1):
             lines.append(f"Entry {i}")
@@ -1073,7 +1127,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
     print("🤖 Bot is running...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
