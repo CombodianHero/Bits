@@ -14,7 +14,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # -------------------------------------------------------------------
-# Logging & Health Server (for Koyeb)
+# Logging & Health Server
 # -------------------------------------------------------------------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -53,23 +53,6 @@ STORAGE = {
     "timetable": "https://bridgetosuccess.learncentre.tech/public/storage/timetable/",
 }
 
-# Session persistence file
-SESSION_FILE = "sessions.json"
-
-def load_sessions():
-    if os.path.exists(SESSION_FILE):
-        try:
-            with open(SESSION_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
-
-def save_sessions(sessions):
-    with open(SESSION_FILE, 'w') as f:
-        json.dump(sessions, f, indent=2)
-
-# In-memory storage (will be restored from file on startup)
 user_sessions = {}
 user_credentials = {}
 user_courses = {}
@@ -83,10 +66,10 @@ def get_device_id(user_id: int) -> str:
     return hashlib.md5(str(user_id).encode()).hexdigest()[:16]
 
 # -------------------------------------------------------------------
-# API Client (with auto-re-login and session saving)
+# API Client (with auto-re-login)
 # -------------------------------------------------------------------
 class BridgeToSuccessAPI:
-    def __init__(self, mobile=None, password=None, android_id=None, telegram_user_id=None):
+    def __init__(self, mobile=None, password=None, android_id=None):
         self.base_url = BASE_URL.rstrip("/") + "/"
         self.session = requests.Session()
         self.user_id = None
@@ -94,7 +77,6 @@ class BridgeToSuccessAPI:
         self.mobile = mobile
         self.password = password
         self.android_id = android_id or uuid.uuid4().hex[:16]
-        self.telegram_user_id = telegram_user_id
 
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36",
@@ -139,8 +121,6 @@ class BridgeToSuccessAPI:
                         self._re_login()
                         self.last_login_time = time.time()
                         self.session.headers.update(self._default_headers())
-                        # Save updated session
-                        self._save_session()
                         continue
                     else:
                         raise PermissionError("Token expired and re‑login failed")
@@ -186,16 +166,6 @@ class BridgeToSuccessAPI:
                 "Authorization": f"Bearer {self.auth_token}"
             })
             logger.info(f"Token updated for user {self.user_id}")
-
-    def _save_session(self):
-        if self.telegram_user_id is None:
-            return
-        sessions = load_sessions()
-        key = str(self.telegram_user_id)
-        if key in sessions:
-            sessions[key]["auth_token"] = self.auth_token
-            sessions[key]["app_user_id"] = self.user_id
-            save_sessions(sessions)
 
     def call(self, tag, **params):
         return self.post({"tag": tag, **params})
@@ -487,18 +457,12 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # Remove from memory and session file
     user_sessions.pop(user_id, None)
     user_credentials.pop(user_id, None)
     user_courses.pop(user_id, None)
     user_all_courses.pop(user_id, None)
     user_free_categories.pop(user_id, None)
     context.user_data.clear()
-    # Remove from sessions file
-    sessions = load_sessions()
-    if str(user_id) in sessions:
-        del sessions[str(user_id)]
-        save_sessions(sessions)
     logger.info(f"User {user_id} logged out manually.")
     await update.message.reply_text("✅ Logged out.")
 
@@ -522,23 +486,13 @@ async def handle_login_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         android_id = get_device_id(user_id)
         await update.message.reply_text("⏳ Logging in...")
         try:
-            api = BridgeToSuccessAPI(mobile=mobile, password=password, android_id=android_id, telegram_user_id=user_id)
+            api = BridgeToSuccessAPI(mobile=mobile, password=password, android_id=android_id)
             result = api.login_api(mobile, password, android_id, "")
             api._process_login_response(result)
             if api.user_id and api.auth_token:
                 user_sessions[user_id] = api
                 user_credentials[user_id] = (mobile, password, android_id)
                 context.user_data["login_step"] = None
-                # Save session
-                sessions = load_sessions()
-                sessions[str(user_id)] = {
-                    "mobile": mobile,
-                    "password": password,
-                    "android_id": android_id,
-                    "app_user_id": api.user_id,
-                    "auth_token": api.auth_token
-                }
-                save_sessions(sessions)
                 await update.message.reply_text(f"✅ Login successful! User ID: {api.user_id}")
                 await update.message.reply_text("⏳ Loading courses...")
                 try:
@@ -953,27 +907,27 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for leaf in leaves:
                     cat_id = leaf["id"]
                     cat_path = leaf["path"]
-                    # Add folder entry for this leaf category
+                    # Add folder entry
                     all_media.append(("", f"📁 {cat_path}"))
-                    # Fetch videos for this leaf category
+                    # Fetch videos
                     try:
                         videos_data = api.all_course_video(cat_id)
                         videos = extract_media_entries(videos_data)
                         for url, title in videos:
                             all_media.append((url, f"  → {title}"))
-                    except Exception as e:
-                        logger.warning(f"Video fetch error for category {cat_id}: {e}")
-                    # Fetch PDFs for this leaf category
+                    except Exception:
+                        pass
+                    # Fetch PDFs
                     try:
                         pdfs_data = api.all_course_pdf(cat_id)
                         pdfs = extract_media_entries(pdfs_data)
                         for url, title in pdfs:
                             all_media.append((url, f"  → {title}"))
-                    except Exception as e:
-                        logger.warning(f"PDF fetch error for category {cat_id}: {e}")
+                    except Exception:
+                        pass
                     time.sleep(0.3)
 
-        # 2. Fallback: if no categories from getAllCategory, try getCategoryMixed
+        # 2. Fallback: if no categories, try getCategoryMixed
         if not all_media:
             mixed_response = api.get_category_mixed(course_id, "")
             mixed_list = None
@@ -1013,16 +967,17 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"No content found for course {course_id}.")
             return
 
-        # Deduplicate by URL (keep first)
+        # 4. Deduplicate – use URL if non‑empty, otherwise use title
         seen = set()
         unique = []
         for url, title in all_media:
-            if url in seen:
+            key = url if url else title
+            if key in seen:
                 continue
-            seen.add(url)
+            seen.add(key)
             unique.append((url, title))
 
-        # Build file
+        # 5. Build and send file
         lines = [f"Course ID: {course_id}"]
         for i, (url, title) in enumerate(unique, 1):
             lines.append(f"Entry {i}")
@@ -1051,33 +1006,7 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Main
 # -------------------------------------------------------------------
 def main():
-    # Restore sessions from file
-    sessions = load_sessions()
-    for user_id_str, creds in sessions.items():
-        try:
-            user_id = int(user_id_str)
-            mobile = creds.get("mobile")
-            password = creds.get("password")
-            android_id = creds.get("android_id")
-            app_user_id = creds.get("app_user_id")
-            auth_token = creds.get("auth_token")
-            if mobile and password:
-                api = BridgeToSuccessAPI(mobile=mobile, password=password, android_id=android_id, telegram_user_id=user_id)
-                api.user_id = app_user_id
-                api.auth_token = auth_token
-                if auth_token:
-                    api.session.headers.update({
-                        "Authtoken": auth_token,
-                        "Authorization": f"Bearer {auth_token}"
-                    })
-                user_sessions[user_id] = api
-                user_credentials[user_id] = (mobile, password, android_id)
-                logger.info(f"Restored session for user {user_id}")
-        except Exception as e:
-            logger.warning(f"Failed to restore session for {user_id_str}: {e}")
-
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("login", login))
@@ -1096,10 +1025,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
-
     print("🤖 Bot is running...")
-    # Drop pending updates to avoid Conflict error
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
