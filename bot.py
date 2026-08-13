@@ -104,6 +104,13 @@ class BridgeToSuccessAPI:
             headers["Authorization"] = f"Bearer {self.auth_token}"
         return headers
 
+    def set_token(self, user_id, auth_token):
+        """Manually set user_id and auth_token without login."""
+        self.user_id = user_id
+        self.auth_token = auth_token
+        self.session.headers.update(self._default_headers())
+        logger.info(f"Token manually set for user {user_id}")
+
     def post(self, data, retries=3):
         for attempt in range(retries):
             try:
@@ -433,6 +440,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome!\n\n"
         "/login – log in with your mobile & password\n"
+        "/login_token <user_id> <auth_token> – log in using an existing token\n"
         "/logout – clear your session\n"
         "/courses – list your purchased courses\n"
         "/allcourses – list **all** available courses with price and full content\n"
@@ -454,6 +462,44 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Enter your mobile number (e.g., 9876543210):")
     context.user_data["login_step"] = "mobile"
+
+async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("❌ Usage: /login_token <user_id> <auth_token>")
+        return
+    uid = args[0].strip()
+    token = args[1].strip()
+    if not uid or not token:
+        await update.message.reply_text("❌ User ID and token cannot be empty.")
+        return
+    try:
+        api = BridgeToSuccessAPI()
+        api.set_token(uid, token)
+        # Test the token by calling a lightweight endpoint (e.g., get_profile)
+        # If it fails, the token is invalid.
+        try:
+            # Use a short timeout to avoid hanging
+            profile = api.get_profile()
+            # If we get here, token works
+            user_sessions[user_id] = api
+            user_credentials[user_id] = (None, None, None)  # no mobile/password
+            # Optionally pre-fetch courses? Skipping to keep it fast.
+            await update.message.reply_text(f"✅ Login successful via token!\nUser ID: {uid}")
+            # Optionally load courses in background
+            await update.message.reply_text("⏳ Loading courses...")
+            try:
+                user_all_courses[user_id] = api.fetch_all_courses_with_details(fetch_my=False)
+                user_courses[user_id] = api.fetch_all_courses_with_details(fetch_my=True)
+                await update.message.reply_text("✅ Courses loaded.")
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ Could not load courses: {e}")
+        except Exception as e:
+            # Token likely invalid
+            await update.message.reply_text(f"❌ Token validation failed: {str(e)}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -515,16 +561,16 @@ async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api = user_sessions.get(user_id)
     if api and api.auth_token:
         await update.message.reply_text(
-            f"✅ Session active.\nUser ID: {api.user_id}\nToken: {'Present' if api.auth_token else 'Missing'}\nMobile: {api.mobile}"
+            f"✅ Session active.\nUser ID: {api.user_id}\nToken: {'Present' if api.auth_token else 'Missing'}\nMobile: {api.mobile if api.mobile else 'Token login'}"
         )
     else:
-        await update.message.reply_text("❌ No active session. Use /login.")
+        await update.message.reply_text("❌ No active session. Use /login or /login_token.")
 
 async def courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
     if not api:
-        await update.message.reply_text("❌ Not logged in. Use /login first.")
+        await update.message.reply_text("❌ Not logged in. Use /login or /login_token first.")
         return
     courses_list = user_courses.get(user_id)
     if not courses_list:
@@ -553,7 +599,7 @@ async def allcourses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
     if not api:
-        await update.message.reply_text("❌ Not logged in. Use /login first.")
+        await update.message.reply_text("❌ Not logged in. Use /login or /login_token first.")
         return
     all_list = user_all_courses.get(user_id)
     if not all_list:
@@ -608,7 +654,7 @@ async def select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
     if not api:
-        await update.message.reply_text("❌ Not logged in.")
+        await update.message.reply_text("❌ Not logged in. Use /login or /login_token first.")
         return
     courses_list = user_courses.get(user_id) or user_all_courses.get(user_id)
     if not courses_list:
@@ -693,7 +739,7 @@ async def free(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
     if not api:
-        await update.message.reply_text("❌ Not logged in. Use /login first.")
+        await update.message.reply_text("❌ Not logged in. Use /login or /login_token first.")
         return
     await update.message.reply_text("📂 Fetching free content...")
     try:
@@ -806,7 +852,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
     if not api:
-        await update.message.reply_text("❌ Not logged in. Use /login first.")
+        await update.message.reply_text("❌ Not logged in. Use /login or /login_token first.")
         return
     try:
         data = api.get_profile()
@@ -818,7 +864,7 @@ async def notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
     if not api:
-        await update.message.reply_text("❌ Not logged in. Use /login first.")
+        await update.message.reply_text("❌ Not logged in. Use /login or /login_token first.")
         return
     try:
         data = api.get_notifications()
@@ -883,7 +929,7 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
     if not api:
-        await update.message.reply_text("❌ Not logged in. Use /login first.")
+        await update.message.reply_text("❌ Not logged in. Use /login or /login_token first.")
         return
 
     args = context.args
@@ -1010,6 +1056,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("login", login))
+    app.add_handler(CommandHandler("login_token", login_token))
     app.add_handler(CommandHandler("logout", logout))
     app.add_handler(CommandHandler("session", session_command))
     app.add_handler(CommandHandler("courses", courses))
