@@ -447,7 +447,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/debug – dump raw API response\n"
         "/debug_categories <course_id> – inspect categories API response (sends a file)\n"
         "/session – check session status\n"
-        "/getcourse <id> – fetch all content (including categories) for a specific course ID\n"
+        "/getcourse <id> – fetch all media (videos/PDFs) for a specific course ID\n"
         "/help – this message"
     )
 
@@ -926,10 +926,15 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     course_id = args[0].strip()
-    all_media = []
+    all_media = []  # each entry: (url, title)
+
+    def add_media(url, title):
+        if url and not url.startswith("http"):
+            url = "https://bridgetosuccess.learncentre.tech/" + url.lstrip("/")
+        all_media.append((url, title))
 
     try:
-        # 1. Fetch category tree
+        # 1. Fetch category tree to get leaf categories
         category_response = api.get_all_category(course_id)
         category_list = None
         if isinstance(category_response, dict) and "category" in category_response:
@@ -940,63 +945,69 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if leaves:
                 for leaf in leaves:
                     cat_id = leaf["id"]
-                    cat_path = leaf["path"]
-                    # Add folder entry
-                    all_media.append(("", f"📁 {cat_path}"))
-
                     # Fetch media for this leaf category
                     try:
                         media_response = api.get_category_mixed(course_id, cat_id)
-                        # Extract list of mixed content items from various possible structures
                         mixed_items = None
+                        # Extract list from various possible structures
                         if isinstance(media_response, list):
                             mixed_items = media_response
                         elif isinstance(media_response, dict):
-                            # Try common keys
                             for key in ["mixedContentItems", "mixedContent", "data", "items"]:
                                 if key in media_response and isinstance(media_response[key], list):
                                     mixed_items = media_response[key]
                                     break
-                            # If not found, maybe the dict itself has the items as values?
-                            if mixed_items is None:
-                                # Sometimes it's {"success":1, "data": {"mixedContentItems": [...]}}
-                                if "data" in media_response and isinstance(media_response["data"], dict):
-                                    data_obj = media_response["data"]
+                            if mixed_items is None and "data" in media_response:
+                                data_obj = media_response["data"]
+                                if isinstance(data_obj, dict):
                                     for key in ["mixedContentItems", "mixedContent", "items"]:
                                         if key in data_obj and isinstance(data_obj[key], list):
                                             mixed_items = data_obj[key]
                                             break
-                                # Or even {"data": [...]}
-                                elif "data" in media_response and isinstance(media_response["data"], list):
-                                    mixed_items = media_response["data"]
+                                elif isinstance(data_obj, list):
+                                    mixed_items = data_obj
 
                         if mixed_items:
                             for item in mixed_items:
                                 item_type = item.get("type")
                                 data_obj = item.get("data", {})
+                                # We only care about videos and PDFs
                                 if item_type == "video":
                                     title = data_obj.get("videoName", "Video")
-                                    video_link = data_obj.get("videoLink")
-                                    if video_link:
-                                        if not video_link.startswith("http"):
-                                            video_link = "https://bridgetosuccess.learncentre.tech/" + video_link.lstrip("/")
-                                        all_media.append((video_link, f"  → {title}"))
+                                    # Collect all possible URL fields
+                                    urls = {}
+                                    for key in ["videoLink", "videoStreamURL", "streamURL", "url"]:
+                                        val = data_obj.get(key)
+                                        if val and val.strip():
+                                            urls[key] = val
+                                    if urls:
+                                        # If multiple URLs, add each with a suffix
+                                        if len(urls) == 1:
+                                            url = list(urls.values())[0]
+                                            add_media(url, title)
+                                        else:
+                                            # Sort keys for consistent order
+                                            sorted_keys = sorted(urls.keys())
+                                            for idx, key in enumerate(sorted_keys, 1):
+                                                url = urls[key]
+                                                add_media(url, f"{title} (Player {idx})")
                                     else:
-                                        all_media.append(("", f"  → {title} (No URL)"))
+                                        # No URL found
+                                        add_media("", title)
                                 elif item_type == "pdf":
                                     title = data_obj.get("pdfTitle", "PDF")
-                                    pdf_file = data_obj.get("pdfFile")
-                                    if pdf_file:
-                                        pdf_url = STORAGE["pdf"] + pdf_file
-                                        all_media.append((pdf_url, f"  → {title}"))
+                                    urls = {}
+                                    for key in ["pdfFile", "pdfUrl", "url"]:
+                                        val = data_obj.get(key)
+                                        if val and val.strip():
+                                            urls[key] = val
+                                    if urls:
+                                        url = list(urls.values())[0]  # usually only one, but take first
+                                        add_media(url, title)
                                     else:
-                                        all_media.append(("", f"  → {title} (No URL)"))
-                        else:
-                            # No media found for this leaf
-                            all_media.append(("", f"  → (No media in this category)"))
+                                        add_media("", title)
                     except Exception as e:
                         logger.warning(f"Failed to fetch media for category {cat_id}: {e}")
-                        all_media.append(("", f"  → (Error fetching media)"))
                     time.sleep(0.3)
 
         # 2. Fallback: if no categories, try getCategoryMixed with empty categoryId
@@ -1022,29 +1033,38 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if mixed_list:
                 for item in mixed_list:
-                    if item.get("type") == "category":
-                        data_obj = item.get("data", {})
-                        cat_name = data_obj.get("categoryName", "Unknown")
-                        all_media.append(("", f"📁 {cat_name} (Category)"))
-                    elif item.get("type") == "video":
-                        data_obj = item.get("data", {})
+                    item_type = item.get("type")
+                    data_obj = item.get("data", {})
+                    if item_type == "video":
                         title = data_obj.get("videoName", "Video")
-                        video_link = data_obj.get("videoLink")
-                        if video_link:
-                            if not video_link.startswith("http"):
-                                video_link = "https://bridgetosuccess.learncentre.tech/" + video_link.lstrip("/")
-                            all_media.append((video_link, title))
+                        urls = {}
+                        for key in ["videoLink", "videoStreamURL", "streamURL", "url"]:
+                            val = data_obj.get(key)
+                            if val and val.strip():
+                                urls[key] = val
+                        if urls:
+                            if len(urls) == 1:
+                                url = list(urls.values())[0]
+                                add_media(url, title)
+                            else:
+                                sorted_keys = sorted(urls.keys())
+                                for idx, key in enumerate(sorted_keys, 1):
+                                    url = urls[key]
+                                    add_media(url, f"{title} (Player {idx})")
                         else:
-                            all_media.append(("", f"{title} (No URL)"))
-                    elif item.get("type") == "pdf":
-                        data_obj = item.get("data", {})
+                            add_media("", title)
+                    elif item_type == "pdf":
                         title = data_obj.get("pdfTitle", "PDF")
-                        pdf_file = data_obj.get("pdfFile")
-                        if pdf_file:
-                            pdf_url = STORAGE["pdf"] + pdf_file
-                            all_media.append((pdf_url, title))
+                        urls = {}
+                        for key in ["pdfFile", "pdfUrl", "url"]:
+                            val = data_obj.get(key)
+                            if val and val.strip():
+                                urls[key] = val
+                        if urls:
+                            url = list(urls.values())[0]
+                            add_media(url, title)
                         else:
-                            all_media.append(("", f"{title} (No URL)"))
+                            add_media("", title)
 
         # 3. Add demo content from courseInfo
         info = api.course_info(course_id)
@@ -1055,16 +1075,16 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timetable_img = course.get("timeTableImg")
             if intro_video_id and intro_video_id != "null" and intro_video_id.strip():
                 video_url = PLAYER_URL + intro_video_id
-                all_media.append((video_url, "Intro Video (Demo)"))
+                add_media(video_url, "Intro Video (Demo)")
             if batch_pdf and batch_pdf.strip():
                 pdf_url = STORAGE["pdf"] + batch_pdf
-                all_media.append((pdf_url, "Batch Info PDF (Demo)"))
+                add_media(pdf_url, "Batch Info PDF (Demo)")
             if timetable_img and timetable_img.strip():
                 img_url = STORAGE["timetable"] + timetable_img
-                all_media.append((img_url, "Timetable Image (Demo)"))
+                add_media(img_url, "Timetable Image (Demo)")
 
         if not all_media:
-            await update.message.reply_text(f"No content found for course {course_id}.")
+            await update.message.reply_text(f"No media found for course {course_id}.")
             return
 
         # Deduplicate – use URL if non‑empty, otherwise use title
@@ -1092,7 +1112,7 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=open(filename, "rb"),
             filename=f"course_{course_id}_media.txt",
-            caption=f"✅ {len(unique)} items for course {course_id}."
+            caption=f"✅ {len(unique)} media items for course {course_id}."
         )
         os.remove(filename)
 
