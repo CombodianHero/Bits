@@ -415,7 +415,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/profile – your profile info\n"
         "/notifications – your notifications\n"
         "/debug – dump raw API response\n"
-        "/debug_categories <course_id> – inspect categories API response\n"
+        "/debug_categories <course_id> – inspect categories API response (sends a file)\n"
         "/session – check session status\n"
         "/getcourse <id> – fetch all content (including categories) for a specific course ID\n"
         "/help – this message"
@@ -835,9 +835,22 @@ async def debug_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Try getAllCategory
         result = api.get_all_category(course_id)
-        msg = f"🔍 **Debug Categories for course {course_id}**\n\n"
-        msg += "**getAllCategory response:**\n```json\n" + json.dumps(result, indent=2) + "\n```\n"
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        # Also try getCategoryMixed for comparison
+        mixed_result = api.get_category_mixed(course_id, "")
+        data = {
+            "course_id": course_id,
+            "getAllCategory": result,
+            "getCategoryMixed": mixed_result
+        }
+        filename = f"debug_categories_{course_id}_{user_id}.json"
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        await update.message.reply_document(
+            document=open(filename, "rb"),
+            filename=f"debug_categories_{course_id}.json",
+            caption=f"🔍 Raw category responses for course {course_id}."
+        )
+        os.remove(filename)
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
