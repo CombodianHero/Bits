@@ -429,6 +429,167 @@ def get_leaf_category_ids(category_list):
     return leaves
 
 # -------------------------------------------------------------------
+# NEW HELPER: fetch all media for a course (used by /getcourse and /youtube)
+# -------------------------------------------------------------------
+def fetch_course_media(api, course_id):
+    """Fetch all media (videos, PDFs, intro, batch, timetable) for a given course.
+       Returns list of (url, title) tuples."""
+    all_media = []
+
+    def add_media(url, title):
+        if url and not url.startswith("http"):
+            url = "https://bridgetosuccess.learncentre.tech/" + url.lstrip("/")
+        all_media.append((url, title))
+
+    try:
+        # 1. Get category tree and leaf categories
+        category_response = api.get_all_category(course_id)
+        category_list = None
+        if isinstance(category_response, dict) and "category" in category_response:
+            category_list = category_response["category"]
+
+        if category_list:
+            leaves = get_leaf_category_ids(category_list)
+            for leaf in leaves:
+                cat_id = leaf["id"]
+                try:
+                    media_response = api.get_category_mixed(course_id, cat_id)
+                    mixed_items = None
+                    if isinstance(media_response, list):
+                        mixed_items = media_response
+                    elif isinstance(media_response, dict):
+                        for key in ["mixedContentItems", "mixedContent", "data", "items"]:
+                            if key in media_response and isinstance(media_response[key], list):
+                                mixed_items = media_response[key]
+                                break
+                        if mixed_items is None and "data" in media_response:
+                            data_obj = media_response["data"]
+                            if isinstance(data_obj, dict):
+                                for key in ["mixedContentItems", "mixedContent", "items"]:
+                                    if key in data_obj and isinstance(data_obj[key], list):
+                                        mixed_items = data_obj[key]
+                                        break
+                            elif isinstance(data_obj, list):
+                                mixed_items = data_obj
+
+                    if mixed_items:
+                        for item in mixed_items:
+                            item_type = item.get("type")
+                            data_obj = item.get("data", {})
+                            if item_type == "video":
+                                title = data_obj.get("videoName", "Video")
+                                urls = {}
+                                for key in ["videoLink", "videoStreamURL", "streamURL", "url"]:
+                                    val = data_obj.get(key)
+                                    if val and val.strip():
+                                        urls[key] = val
+                                if urls:
+                                    if len(urls) == 1:
+                                        url = list(urls.values())[0]
+                                        add_media(url, title)
+                                    else:
+                                        sorted_keys = sorted(urls.keys())
+                                        for idx, key in enumerate(sorted_keys, 1):
+                                            url = urls[key]
+                                            add_media(url, f"{title} (Player {idx})")
+                                else:
+                                    add_media("", title)
+                            elif item_type == "pdf":
+                                title = data_obj.get("pdfTitle", "PDF")
+                                urls = {}
+                                for key in ["pdfFile", "pdfUrl", "url"]:
+                                    val = data_obj.get(key)
+                                    if val and val.strip():
+                                        urls[key] = val
+                                if urls:
+                                    url = list(urls.values())[0]
+                                    add_media(url, title)
+                                else:
+                                    add_media("", title)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch media for category {cat_id}: {e}")
+                time.sleep(0.3)
+
+        # 2. Fallback: try getCategoryMixed with empty categoryId
+        if not all_media:
+            mixed_response = api.get_category_mixed(course_id, "")
+            mixed_list = None
+            if isinstance(mixed_response, list):
+                mixed_list = mixed_response
+            elif isinstance(mixed_response, dict):
+                for key in ["mixedContentItems", "mixedContent", "data", "items"]:
+                    if key in mixed_response and isinstance(mixed_response[key], list):
+                        mixed_list = mixed_response[key]
+                        break
+                if mixed_list is None and "data" in mixed_response:
+                    data_obj = mixed_response["data"]
+                    if isinstance(data_obj, dict):
+                        for key in ["mixedContentItems", "mixedContent", "items"]:
+                            if key in data_obj and isinstance(data_obj[key], list):
+                                mixed_list = data_obj[key]
+                                break
+                    elif isinstance(data_obj, list):
+                        mixed_list = data_obj
+
+            if mixed_list:
+                for item in mixed_list:
+                    item_type = item.get("type")
+                    data_obj = item.get("data", {})
+                    if item_type == "video":
+                        title = data_obj.get("videoName", "Video")
+                        urls = {}
+                        for key in ["videoLink", "videoStreamURL", "streamURL", "url"]:
+                            val = data_obj.get(key)
+                            if val and val.strip():
+                                urls[key] = val
+                        if urls:
+                            if len(urls) == 1:
+                                url = list(urls.values())[0]
+                                add_media(url, title)
+                            else:
+                                sorted_keys = sorted(urls.keys())
+                                for idx, key in enumerate(sorted_keys, 1):
+                                    url = urls[key]
+                                    add_media(url, f"{title} (Player {idx})")
+                        else:
+                            add_media("", title)
+                    elif item_type == "pdf":
+                        title = data_obj.get("pdfTitle", "PDF")
+                        urls = {}
+                        for key in ["pdfFile", "pdfUrl", "url"]:
+                            val = data_obj.get(key)
+                            if val and val.strip():
+                                urls[key] = val
+                        if urls:
+                            url = list(urls.values())[0]
+                            add_media(url, title)
+                        else:
+                            add_media("", title)
+
+        # 3. Add demo content from courseInfo
+        info = api.course_info(course_id)
+        if info and "courses" in info and len(info["courses"]) > 0:
+            course = info["courses"][0]
+            intro_video_id = course.get("introVideoId")
+            batch_pdf = course.get("batchInfoPdf")
+            timetable_img = course.get("timeTableImg")
+            if intro_video_id and intro_video_id != "null" and intro_video_id.strip():
+                video_url = PLAYER_URL + intro_video_id
+                add_media(video_url, "Intro Video (Demo)")
+            if batch_pdf and batch_pdf.strip():
+                pdf_url = STORAGE["pdf"] + batch_pdf
+                add_media(pdf_url, "Batch Info PDF (Demo)")
+            if timetable_img and timetable_img.strip():
+                img_url = STORAGE["timetable"] + timetable_img
+                add_media(img_url, "Timetable Image (Demo)")
+
+    except Exception as e:
+        logger.error(f"fetch_course_media error: {e}")
+        raise
+
+    return all_media
+
+# -------------------------------------------------------------------
 # Telegram Bot Handlers
 # -------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -448,6 +609,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/debug_categories <course_id> – inspect categories API response (sends a file)\n"
         "/session – check session status\n"
         "/getcourse <id> – fetch all media (videos/PDFs) for a specific course ID\n"
+        "/youtube <id> – extract **only YouTube links** from a course\n"
         "/help – this message"
     )
 
@@ -913,6 +1075,7 @@ async def debug_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
+# --- Refactored /getcourse to use the new helper ---
 async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     api = user_sessions.get(user_id)
@@ -926,162 +1089,10 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     course_id = args[0].strip()
-    all_media = []  # each entry: (url, title)
-
-    def add_media(url, title):
-        if url and not url.startswith("http"):
-            url = "https://bridgetosuccess.learncentre.tech/" + url.lstrip("/")
-        all_media.append((url, title))
+    await update.message.reply_text(f"📥 Fetching all media for course {course_id}...")
 
     try:
-        # 1. Fetch category tree to get leaf categories
-        category_response = api.get_all_category(course_id)
-        category_list = None
-        if isinstance(category_response, dict) and "category" in category_response:
-            category_list = category_response["category"]
-
-        if category_list:
-            leaves = get_leaf_category_ids(category_list)
-            if leaves:
-                for leaf in leaves:
-                    cat_id = leaf["id"]
-                    # Fetch media for this leaf category
-                    try:
-                        media_response = api.get_category_mixed(course_id, cat_id)
-                        mixed_items = None
-                        # Extract list from various possible structures
-                        if isinstance(media_response, list):
-                            mixed_items = media_response
-                        elif isinstance(media_response, dict):
-                            for key in ["mixedContentItems", "mixedContent", "data", "items"]:
-                                if key in media_response and isinstance(media_response[key], list):
-                                    mixed_items = media_response[key]
-                                    break
-                            if mixed_items is None and "data" in media_response:
-                                data_obj = media_response["data"]
-                                if isinstance(data_obj, dict):
-                                    for key in ["mixedContentItems", "mixedContent", "items"]:
-                                        if key in data_obj and isinstance(data_obj[key], list):
-                                            mixed_items = data_obj[key]
-                                            break
-                                elif isinstance(data_obj, list):
-                                    mixed_items = data_obj
-
-                        if mixed_items:
-                            for item in mixed_items:
-                                item_type = item.get("type")
-                                data_obj = item.get("data", {})
-                                # We only care about videos and PDFs
-                                if item_type == "video":
-                                    title = data_obj.get("videoName", "Video")
-                                    # Collect all possible URL fields
-                                    urls = {}
-                                    for key in ["videoLink", "videoStreamURL", "streamURL", "url"]:
-                                        val = data_obj.get(key)
-                                        if val and val.strip():
-                                            urls[key] = val
-                                    if urls:
-                                        # If multiple URLs, add each with a suffix
-                                        if len(urls) == 1:
-                                            url = list(urls.values())[0]
-                                            add_media(url, title)
-                                        else:
-                                            # Sort keys for consistent order
-                                            sorted_keys = sorted(urls.keys())
-                                            for idx, key in enumerate(sorted_keys, 1):
-                                                url = urls[key]
-                                                add_media(url, f"{title} (Player {idx})")
-                                    else:
-                                        # No URL found
-                                        add_media("", title)
-                                elif item_type == "pdf":
-                                    title = data_obj.get("pdfTitle", "PDF")
-                                    urls = {}
-                                    for key in ["pdfFile", "pdfUrl", "url"]:
-                                        val = data_obj.get(key)
-                                        if val and val.strip():
-                                            urls[key] = val
-                                    if urls:
-                                        url = list(urls.values())[0]  # usually only one, but take first
-                                        add_media(url, title)
-                                    else:
-                                        add_media("", title)
-                    except Exception as e:
-                        logger.warning(f"Failed to fetch media for category {cat_id}: {e}")
-                    time.sleep(0.3)
-
-        # 2. Fallback: if no categories, try getCategoryMixed with empty categoryId
-        if not all_media:
-            mixed_response = api.get_category_mixed(course_id, "")
-            mixed_list = None
-            if isinstance(mixed_response, list):
-                mixed_list = mixed_response
-            elif isinstance(mixed_response, dict):
-                for key in ["mixedContentItems", "mixedContent", "data", "items"]:
-                    if key in mixed_response and isinstance(mixed_response[key], list):
-                        mixed_list = mixed_response[key]
-                        break
-                if mixed_list is None and "data" in mixed_response:
-                    data_obj = mixed_response["data"]
-                    if isinstance(data_obj, dict):
-                        for key in ["mixedContentItems", "mixedContent", "items"]:
-                            if key in data_obj and isinstance(data_obj[key], list):
-                                mixed_list = data_obj[key]
-                                break
-                    elif isinstance(data_obj, list):
-                        mixed_list = data_obj
-
-            if mixed_list:
-                for item in mixed_list:
-                    item_type = item.get("type")
-                    data_obj = item.get("data", {})
-                    if item_type == "video":
-                        title = data_obj.get("videoName", "Video")
-                        urls = {}
-                        for key in ["videoLink", "videoStreamURL", "streamURL", "url"]:
-                            val = data_obj.get(key)
-                            if val and val.strip():
-                                urls[key] = val
-                        if urls:
-                            if len(urls) == 1:
-                                url = list(urls.values())[0]
-                                add_media(url, title)
-                            else:
-                                sorted_keys = sorted(urls.keys())
-                                for idx, key in enumerate(sorted_keys, 1):
-                                    url = urls[key]
-                                    add_media(url, f"{title} (Player {idx})")
-                        else:
-                            add_media("", title)
-                    elif item_type == "pdf":
-                        title = data_obj.get("pdfTitle", "PDF")
-                        urls = {}
-                        for key in ["pdfFile", "pdfUrl", "url"]:
-                            val = data_obj.get(key)
-                            if val and val.strip():
-                                urls[key] = val
-                        if urls:
-                            url = list(urls.values())[0]
-                            add_media(url, title)
-                        else:
-                            add_media("", title)
-
-        # 3. Add demo content from courseInfo
-        info = api.course_info(course_id)
-        if info and "courses" in info and len(info["courses"]) > 0:
-            course = info["courses"][0]
-            intro_video_id = course.get("introVideoId")
-            batch_pdf = course.get("batchInfoPdf")
-            timetable_img = course.get("timeTableImg")
-            if intro_video_id and intro_video_id != "null" and intro_video_id.strip():
-                video_url = PLAYER_URL + intro_video_id
-                add_media(video_url, "Intro Video (Demo)")
-            if batch_pdf and batch_pdf.strip():
-                pdf_url = STORAGE["pdf"] + batch_pdf
-                add_media(pdf_url, "Batch Info PDF (Demo)")
-            if timetable_img and timetable_img.strip():
-                img_url = STORAGE["timetable"] + timetable_img
-                add_media(img_url, "Timetable Image (Demo)")
+        all_media = fetch_course_media(api, course_id)
 
         if not all_media:
             await update.message.reply_text(f"No media found for course {course_id}.")
@@ -1105,6 +1116,7 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"URL: {url if url else '(No URL)'}")
             lines.append("")
         content = "\n".join(lines)
+
         filename = f"course_{course_id}_{user_id}.txt"
         with open(filename, "w", encoding="utf-8") as f:
             f.write(content)
@@ -1113,6 +1125,64 @@ async def getcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
             document=open(filename, "rb"),
             filename=f"course_{course_id}_media.txt",
             caption=f"✅ {len(unique)} media items for course {course_id}."
+        )
+        os.remove(filename)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+# --- NEW COMMAND: /youtube to extract only YouTube links ---
+async def youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    api = user_sessions.get(user_id)
+    if not api:
+        await update.message.reply_text("❌ Not logged in. Use /login or /login_token first.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Please provide a course ID: /youtube 91")
+        return
+
+    course_id = args[0].strip()
+    await update.message.reply_text(f"🔍 Searching for YouTube links in course {course_id}...")
+
+    try:
+        all_media = fetch_course_media(api, course_id)
+        # Filter YouTube URLs
+        youtube_media = []
+        for url, title in all_media:
+            if url and ("youtube.com" in url or "youtu.be" in url):
+                youtube_media.append((url, title))
+
+        if not youtube_media:
+            await update.message.reply_text(f"No YouTube links found in course {course_id}.")
+            return
+
+        # Deduplicate by URL
+        seen = set()
+        unique = []
+        for url, title in youtube_media:
+            if url not in seen:
+                seen.add(url)
+                unique.append((url, title))
+
+        lines = [f"🎬 YouTube links for course {course_id}"]
+        for i, (url, title) in enumerate(unique, 1):
+            lines.append(f"Entry {i}")
+            lines.append(f"Title: {title}")
+            lines.append(f"URL: {url}")
+            lines.append("")
+        content = "\n".join(lines)
+
+        filename = f"youtube_{course_id}_{user_id}.txt"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        await update.message.reply_document(
+            document=open(filename, "rb"),
+            filename=f"youtube_links_{course_id}.txt",
+            caption=f"✅ Found {len(unique)} YouTube links for course {course_id}."
         )
         os.remove(filename)
 
@@ -1143,6 +1213,7 @@ def main():
     app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("debug_categories", debug_categories))
     app.add_handler(CommandHandler("getcourse", getcourse))
+    app.add_handler(CommandHandler("youtube", youtube))   # <-- new command
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
